@@ -62,6 +62,10 @@ import org.javacs.kt.CompilerConfiguration
 import org.javacs.kt.ScriptsConfiguration
 import org.javacs.kt.util.KotlinLSException
 import org.javacs.kt.util.LoggingMessageCollector
+import org.jetbrains.kotlin.backend.jvm.JvmIrCodegenFactory
+import org.jetbrains.kotlin.cli.common.output.writeAllTo
+import org.jetbrains.kotlin.codegen.ClassBuilderFactories
+import org.jetbrains.kotlin.codegen.state.GenerationState
 import org.jetbrains.kotlin.container.getService
 import org.jetbrains.kotlin.descriptors.ModuleDescriptor
 import org.jetbrains.kotlin.cli.jvm.compiler.CliBindingTrace
@@ -587,8 +591,19 @@ class Compiler(
     }
 
     fun generateCode(module: ModuleDescriptor, bindingContext: BindingContext, files: Collection<KtFile>) {
-        outputDirectory.takeIf { codegenConfig.enabled }?.let {
-            LOG.warn("Code generation is not supported with Kotlin 2.3+ (old JVM backend was removed)")
+        outputDirectory.takeIf { codegenConfig.enabled }?.let { outDir ->
+            compileLock.withLock {
+                val compileEnv = compileEnvironmentFor(CompilationKind.DEFAULT)
+                val state = GenerationState(
+                    project = compileEnv.environment.project,
+                    module = module,
+                    configuration = compileEnv.environment.configuration,
+                    builderFactory = ClassBuilderFactories.BINARIES,
+                )
+                val codegenFactory = JvmIrCodegenFactory(compileEnv.environment.configuration)
+                codegenFactory.convertAndGenerate(files, state, bindingContext)
+                state.factory.writeAllTo(outDir)
+            }
         }
     }
 
