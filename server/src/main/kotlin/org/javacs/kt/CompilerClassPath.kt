@@ -1,6 +1,7 @@
 package org.javacs.kt
 
 import org.javacs.kt.classpath.ClassPathEntry
+import org.javacs.kt.classpath.ClassPathInstrumentation
 import org.javacs.kt.classpath.defaultClassPathResolver
 import org.javacs.kt.compiler.Compiler
 import org.javacs.kt.database.DatabaseService
@@ -10,6 +11,7 @@ import java.io.File
 import java.nio.file.FileSystems
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.concurrent.CompletableFuture
 
 /**
  * Manages the class path (compiled JARs, etc), the Java source path
@@ -19,9 +21,14 @@ class CompilerClassPath(
     private val config: CompilerConfiguration,
     private val scriptsConfig: ScriptsConfiguration,
     private val codegenConfig: CodegenConfiguration,
-    private val databaseService: DatabaseService
+    private val databaseService: DatabaseService,
+    private val resolverFactory: (Collection<Path>, org.jetbrains.exposed.sql.Database?) -> org.javacs.kt.classpath.ClassPathResolver = ::defaultClassPathResolver
 ) : Closeable {
     val workspaceRoots = mutableSetOf<Path>()
+    private val modelLock = Any()
+    @Volatile private var modelReady = CompletableFuture<Boolean>()
+    private var inFlightRefresh: CompletableFuture<Boolean>? = null
+    private var inFlightReadiness: CompletableFuture<Boolean>? = null
 
     private val javaSourcePath = mutableSetOf<Path>()
     private val buildScriptClassPath = mutableSetOf<Path>()
@@ -29,73 +36,207 @@ class CompilerClassPath(
     val outputDirectory: File = Files.createTempDirectory("klsBuildOutput").toFile()
     val javaHome: String? = System.getProperty("java.home", null)
 
-    var compiler = Compiler(
-        javaSourcePath,
-        classPath.map { it.compiledJar }.toSet(),
-        buildScriptClassPath,
+    private var compilerInstance: Compiler? = null
+    private var compilerWarmup: CompletableFuture<Compiler>? = null
+    private var warmupJavaSources = emptySet<Path>()
+    private var warmupCompiledPaths = emptySet<Path>()
+    private var warmupBuildScriptPaths = emptySet<Path>()
+    private var installedJavaSources = emptySet<Path>()
+    private var installedCompiledPaths = emptySet<Path>()
+    private var installedBuildScriptPaths = emptySet<Path>()
+    val compiler: Compiler
+        get() = synchronized(modelLock) {
+            compilerInstance ?: compilerWarmup?.let(::claimCompiler)
+                ?: createCompiler().also {
+                    installCompiler(
+                        it,
+                        javaSourcePath.toSet(),
+                        classPath.map { entry -> entry.compiledJar }.toSet(),
+                        buildScriptClassPath.toSet()
+                    )
+                }
+        }
+
+    private fun createCompiler(
+        javaSources: Set<Path> = javaSourcePath.toSet(),
+        compiledPaths: Set<Path> = classPath.map { it.compiledJar }.toSet(),
+        buildScriptPaths: Set<Path> = buildScriptClassPath.toSet()
+    ): Compiler = Compiler(
+        javaSources,
+        compiledPaths,
+        buildScriptPaths,
         scriptsConfig,
         codegenConfig,
         outputDirectory
-    )
-        private set
+    ).also { it.updateConfiguration(config) }
+
+    private fun startCompilerWarmup(
+        javaSources: Set<Path> = emptySet(),
+        compiledPaths: Set<Path> = emptySet(),
+        buildScriptPaths: Set<Path> = emptySet()
+    ): CompletableFuture<Compiler> = synchronized(modelLock) {
+        compilerWarmup ?: run {
+            warmupJavaSources = javaSources
+            warmupCompiledPaths = compiledPaths
+            warmupBuildScriptPaths = buildScriptPaths
+            CompletableFuture.supplyAsync {
+                createCompiler(javaSources, compiledPaths, buildScriptPaths)
+            }.also { compilerWarmup = it }
+        }
+    }
+
+    private fun claimCompiler(warmup: CompletableFuture<Compiler>): Compiler = warmup.join().also {
+        if (compilerWarmup === warmup) compilerWarmup = null
+        installCompiler(it, warmupJavaSources, warmupCompiledPaths, warmupBuildScriptPaths)
+    }
+
+    private fun installCompiler(
+        compiler: Compiler,
+        javaSources: Set<Path>,
+        compiledPaths: Set<Path>,
+        buildScriptPaths: Set<Path>
+    ) {
+        compilerInstance = compiler
+        installedJavaSources = javaSources
+        installedCompiledPaths = compiledPaths
+        installedBuildScriptPaths = buildScriptPaths
+    }
+
+    private fun discardCompilerWarmup(warmup: CompletableFuture<Compiler>?) {
+        if (warmup == null) return
+        synchronized(modelLock) {
+            if (compilerWarmup === warmup) compilerWarmup = null
+        }
+        warmup.thenAccept(Compiler::close)
+    }
 
     private val async = AsyncExecutor()
 
-    init {
-        compiler.updateConfiguration(config)
-    }
-
     /** Updates and possibly reinstantiates the compiler using new paths. */
+    @Suppress("TooGenericExceptionCaught", "ReturnCount", "LongMethod", "CyclomaticComplexMethod")
     private fun refresh(
         updateClassPath: Boolean = true,
         updateBuildScriptClassPath: Boolean = true,
         updateJavaSourcePath: Boolean = true
     ): Boolean {
-        // TODO: Fetch class path and build script class path concurrently (and asynchronously)
-        val resolver = defaultClassPathResolver(workspaceRoots, databaseService.db)
-        var refreshCompiler = updateJavaSourcePath
-
-        if (updateClassPath) {
-            val newClassPath = resolver.classpathOrEmpty
-            if (newClassPath != classPath) {
-                synchronized(classPath) {
-                    syncPaths(classPath, newClassPath, "class path") { it.compiledJar }
-                }
-                refreshCompiler = true
-            }
-
-            async.compute {
-                val newClassPathWithSources = resolver.classpathWithSources
-                synchronized(classPath) {
-                    syncPaths(classPath, newClassPathWithSources, "class path with sources") { it.compiledJar }
-                }
-            }
-        }
-
-        if (updateBuildScriptClassPath) {
-            LOG.info("Update build script path")
-            val newBuildScriptClassPath = resolver.buildScriptClasspathOrEmpty
-            if (newBuildScriptClassPath != buildScriptClassPath) {
-                syncPaths(buildScriptClassPath, newBuildScriptClassPath, "build script class path") { it }
-                refreshCompiler = true
-            }
-        }
-
-        if (refreshCompiler) {
-            LOG.info("Reinstantiating compiler")
-            compiler.close()
-            compiler = Compiler(
-                javaSourcePath,
+        val resolvedJavaSources = javaSourcePath.toSet()
+        val compilerWarmupForRefresh = if (compilerInstance == null) {
+            startCompilerWarmup(
+                javaSourcePath.toSet(),
                 classPath.map { it.compiledJar }.toSet(),
-                buildScriptClassPath,
-                scriptsConfig,
-                codegenConfig,
-                outputDirectory
+                buildScriptClassPath.toSet()
             )
-            updateCompilerConfiguration()
-        }
+        } else null
+        val resolver = resolverFactory(workspaceRoots, databaseService.db)
+        val resolved = if (updateClassPath || updateBuildScriptClassPath) {
+            ClassPathInstrumentation.classpathAccess()
+            ClassPathInstrumentation.classpathWithSourcesAccess()
+            ClassPathInstrumentation.buildScriptClasspathAccess()
+            try {
+                resolver.resolve()
+            } catch (error: Exception) {
+                discardCompilerWarmup(compilerWarmupForRefresh)
+                LOG.warn("Project-model refresh failed; retaining the last valid model: {}", error.message)
+                return false
+            }
+        } else null
 
-        return refreshCompiler
+        synchronized(modelLock) {
+            if (resolved != null && resolved.classpath.isEmpty() && classPath.isNotEmpty()) {
+                discardCompilerWarmup(compilerWarmupForRefresh)
+                LOG.warn("Project-model refresh returned an empty classpath; retaining the last valid model")
+                return false
+            }
+
+            var refreshCompiler = updateJavaSourcePath && resolvedJavaSources != installedJavaSources
+            if (refreshCompiler) {
+                logAdded(resolvedJavaSources - installedJavaSources, "Java source path")
+                logRemoved(installedJavaSources - resolvedJavaSources, "Java source path")
+            }
+            if (updateClassPath && resolved != null && resolved.classpath != classPath) {
+                syncPaths(classPath, resolved.classpath, "class path with sources") { it.compiledJar }
+                refreshCompiler = true
+            }
+            if (updateBuildScriptClassPath && resolved != null && resolved.buildScriptClasspath != buildScriptClassPath) {
+                syncPaths(buildScriptClassPath, resolved.buildScriptClasspath, "build script class path") { it }
+                refreshCompiler = true
+            }
+
+            if (refreshCompiler) {
+                LOG.info("Reinstantiating compiler")
+                val reusable = compilerInstance ?: compilerWarmupForRefresh?.let(::claimCompiler)
+                val newJavaSources = javaSourcePath.toSet()
+                val newCompiledPaths = classPath.map { it.compiledJar }.toSet()
+                val newBuildScriptPaths = buildScriptClassPath.toSet()
+                val additiveUpdate = installedJavaSources == newJavaSources &&
+                    installedCompiledPaths.all(newCompiledPaths::contains) &&
+                    installedBuildScriptPaths.all(newBuildScriptPaths::contains)
+                if (reusable != null && additiveUpdate) {
+                    reusable.updateClasspath(newJavaSources, newCompiledPaths, newBuildScriptPaths)
+                    reusable.updateConfiguration(config)
+                    installCompiler(reusable, newJavaSources, newCompiledPaths, newBuildScriptPaths)
+                } else {
+                    discardCompilerWarmup(compilerWarmupForRefresh)
+                    reusable?.close()
+                    compilerInstance?.takeUnless { it === reusable }?.close()
+                    installCompiler(
+                        createCompiler(newJavaSources, newCompiledPaths, newBuildScriptPaths),
+                        newJavaSources,
+                        newCompiledPaths,
+                        newBuildScriptPaths
+                    )
+                }
+            }
+            return refreshCompiler
+        }
+    }
+
+    /** Records roots without starting dependency discovery. */
+    fun recordWorkspaceRoots(roots: Collection<Path>) {
+        synchronized(modelLock) {
+            workspaceRoots.clear()
+            workspaceRoots.addAll(normalizeRoots(roots))
+            if (compilerInstance == null) startCompilerWarmup(javaSources = javaSourcePath.toSet())
+            if (modelReady.isDone || inFlightRefresh?.isDone == false) modelReady = CompletableFuture()
+        }
+    }
+
+    /** Records Java sources found during the source-path traversal. */
+    fun recordJavaSourcePaths(paths: Collection<Path>) {
+        synchronized(modelLock) {
+            javaSourcePath.clear()
+            javaSourcePath.addAll(paths)
+        }
+    }
+
+    /** Coalesces concurrent refresh requests into one model resolution. */
+    fun refreshAsync(): CompletableFuture<Boolean> = synchronized(modelLock) {
+        inFlightRefresh?.takeUnless { it.isDone }?.let { active ->
+            return@synchronized if (modelReady === inFlightReadiness) active
+            else active.thenCompose { refreshAsync() }
+        }
+        if (modelReady.isDone) modelReady = CompletableFuture()
+        val readinessForRefresh = modelReady
+        val future = async.compute { refresh() }
+        inFlightRefresh = future
+        inFlightReadiness = readinessForRefresh
+        future.whenComplete { refreshed, error ->
+            synchronized(modelLock) {
+                if (inFlightRefresh === future) {
+                    inFlightRefresh = null
+                    inFlightReadiness = null
+                }
+                if (error == null) readinessForRefresh.complete(refreshed) else readinessForRefresh.completeExceptionally(error)
+            }
+        }
+        future
+    }
+
+    /** Waits until the startup model applicable to this workspace is available. */
+    fun awaitReady(file: Path? = null) {
+        val ready = modelReady
+        if (!ready.isDone) LOG.info("Waiting for project model{}", file?.let { " for $it" } ?: "")
+        ready.join()
     }
 
     /** Synchronizes the given two path sets and logs the differences. */
@@ -111,7 +252,7 @@ class CompilerClassPath(
     }
 
     fun updateCompilerConfiguration() {
-        compiler.updateConfiguration(config)
+        compilerInstance?.updateConfiguration(config)
     }
 
     fun addWorkspaceRoot(root: Path): Boolean {
@@ -169,7 +310,9 @@ class CompilerClassPath(
     }
 
     override fun close() {
-        compiler.close()
+        compilerInstance?.close()
+        compilerWarmup?.thenAccept(Compiler::close)
+        compilerWarmup = null
         outputDirectory.delete()
     }
 }

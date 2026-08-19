@@ -7,7 +7,7 @@ allprojects { project ->
         doLast {
             (fileTree("$gradle.gradleHomeDir/lib") + fileTree("$gradle.gradleUserHomeDir/caches/$gradle.gradleVersion/generated-gradle-jars") + fileTree("$gradle.gradleUserHomeDir/caches/modules-2/files-2.1"))
                 .findAll { it.name =~ pattern }
-                .forEach { System.out.println "kotlin-lsp-gradle $it" }
+                .forEach { System.out.println "kotlin-lsp-buildscript $it" }
 
             def projectAccessorsClassPathProperty = "gradleKotlinDsl.projectAccessorsClassPath"
             def pluginAccessorsClassPathProperty = "gradleKotlinDsl.pluginAccessorsClassPath"
@@ -17,14 +17,14 @@ allprojects { project ->
                 project.getProperty(projectAccessorsClassPathProperty)
                     .bin
                     .asFiles
-                    .forEach { System.out.println "kotlin-lsp-gradle $it" }
+                    .forEach { System.out.println "kotlin-lsp-buildscript $it" }
             }
 
             if (project.hasProperty(pluginAccessorsClassPathProperty)) {
                 project.getProperty(pluginAccessorsClassPathProperty)
                     .bin
                     .asFiles
-                    .forEach { System.out.println "kotlin-lsp-gradle $it" }
+                    .forEach { System.out.println "kotlin-lsp-buildscript $it" }
             }
         }
     }

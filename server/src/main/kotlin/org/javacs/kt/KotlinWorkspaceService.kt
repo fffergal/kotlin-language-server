@@ -17,12 +17,15 @@ import com.google.gson.JsonElement
 import com.google.gson.Gson
 import com.google.gson.JsonObject
 
+@Suppress("LongParameterList")
 class KotlinWorkspaceService(
     private val sf: SourceFiles,
     private val sp: SourcePath,
     private val cp: CompilerClassPath,
     private val docService: KotlinTextDocumentService,
-    private val config: Configuration
+    private val config: Configuration,
+    private val onConfigurationChanged: (Boolean) -> Unit = {},
+    private val onWorkspaceRootsChanged: (Collection<java.nio.file.Path>) -> Unit = {}
 ) : WorkspaceService, LanguageClientAware {
     private val gson = Gson()
     private var languageClient: LanguageClient? = null
@@ -191,6 +194,11 @@ class KotlinWorkspaceService(
         }
 
         LOG.info("Updated configuration: {}", settings)
+        val kotlinSettings = settings?.get("kotlin")?.asJsonObject
+        val affectsProjectModel = kotlinSettings?.let {
+            it.has("compiler") || it.has("scripts") || it.has("codegen")
+        } ?: false
+        onConfigurationChanged(affectsProjectModel)
     }
 
     @Suppress("DEPRECATION")
@@ -203,25 +211,15 @@ class KotlinWorkspaceService(
     override fun didChangeWorkspaceFolders(params: DidChangeWorkspaceFoldersParams) {
         for (change in params.event.removed) {
             LOG.info("Dropping workspace {} from source path", change.uri)
-
-            val root = Paths.get(parseURI(change.uri))
-
+            val root = Paths.get(parseURI(change.uri)).toAbsolutePath().normalize()
             sf.removeWorkspaceRoot(root)
-            val refreshed = cp.removeWorkspaceRoot(root)
-            if (refreshed) {
-                sp.refresh()
-            }
         }
         for (change in params.event.added) {
             LOG.info("Adding workspace {} to source path", change.uri)
-
-            val root = Paths.get(parseURI(change.uri))
-
+            val root = Paths.get(parseURI(change.uri)).toAbsolutePath().normalize()
             sf.addWorkspaceRoot(root)
-            val refreshed = cp.addWorkspaceRoot(root)
-            if (refreshed) {
-                sp.refresh()
-            }
         }
+        cp.recordJavaSourcePaths(sf.javaSourcePaths)
+        onWorkspaceRootsChanged(sf.requestedWorkspaceRootPaths)
     }
 }

@@ -7,97 +7,66 @@ import org.jetbrains.exposed.dao.id.EntityID
 import org.jetbrains.exposed.dao.id.IntIdTable
 import org.jetbrains.exposed.sql.Database
 import org.jetbrains.exposed.sql.SchemaUtils
-import org.jetbrains.exposed.sql.deleteAll
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
+import org.jetbrains.exposed.sql.deleteWhere
+import org.jetbrains.exposed.sql.insert
+import org.jetbrains.exposed.sql.select
 import org.jetbrains.exposed.sql.transactions.transaction
+import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
 
 private const val MAX_PATH_LENGTH = 2047
+private const val MAX_IDENTITY_LENGTH = 2047
+private const val MAX_FINGERPRINT_LENGTH = 8192
 
 private object ClassPathMetadataCache : IntIdTable() {
+    val projectIdentity = varchar("projectidentity", MAX_IDENTITY_LENGTH).uniqueIndex()
+    val fingerprint = varchar("fingerprint", MAX_FINGERPRINT_LENGTH)
     val includesSources = bool("includessources")
-    val buildFileVersion = long("buildfileversion").nullable()
 }
 
 private object ClassPathCacheEntry : IntIdTable() {
-    val compiledJar = varchar("compiledjar", length = MAX_PATH_LENGTH)
-    val sourceJar = varchar("sourcejar", length = MAX_PATH_LENGTH).nullable()
+    val projectIdentity = varchar("projectidentity", MAX_IDENTITY_LENGTH).index()
+    val compiledJar = varchar("compiledjar", MAX_PATH_LENGTH)
+    val sourceJar = varchar("sourcejar", MAX_PATH_LENGTH).nullable()
 }
 
 private object BuildScriptClassPathCacheEntry : IntIdTable() {
-    val jar = varchar("jar", length = MAX_PATH_LENGTH)
+    val projectIdentity = varchar("projectidentity", MAX_IDENTITY_LENGTH).index()
+    val jar = varchar("jar", MAX_PATH_LENGTH)
 }
 
 class ClassPathMetadataCacheEntity(id: EntityID<Int>) : IntEntity(id) {
     companion object : IntEntityClass<ClassPathMetadataCacheEntity>(ClassPathMetadataCache)
-
+    var projectIdentity by ClassPathMetadataCache.projectIdentity
+    var fingerprint by ClassPathMetadataCache.fingerprint
     var includesSources by ClassPathMetadataCache.includesSources
-    var buildFileVersion by ClassPathMetadataCache.buildFileVersion
 }
 
 class ClassPathCacheEntryEntity(id: EntityID<Int>) : IntEntity(id) {
     companion object : IntEntityClass<ClassPathCacheEntryEntity>(ClassPathCacheEntry)
-
+    var projectIdentity by ClassPathCacheEntry.projectIdentity
     var compiledJar by ClassPathCacheEntry.compiledJar
     var sourceJar by ClassPathCacheEntry.sourceJar
 }
 
 class BuildScriptClassPathCacheEntryEntity(id: EntityID<Int>) : IntEntity(id) {
     companion object : IntEntityClass<BuildScriptClassPathCacheEntryEntity>(BuildScriptClassPathCacheEntry)
-
+    var projectIdentity by BuildScriptClassPathCacheEntry.projectIdentity
     var jar by BuildScriptClassPathCacheEntry.jar
 }
 
-/** A classpath resolver that caches another resolver */
+/** Persists one resolver's coherent project model without affecting other projects. */
 internal class CachedClassPathResolver(
     private val wrapped: ClassPathResolver,
-    private val db: Database
+    private val db: Database,
+    private val projectIdentity: String = requireNotNull(wrapped.cacheIdentity)
 ) : ClassPathResolver {
     override val resolverType: String get() = "Cached + ${wrapped.resolverType}"
-
-    private var cachedClassPathEntries: Set<ClassPathEntry>
-        get() = transaction(db) {
-            ClassPathCacheEntryEntity.all().map {
-                ClassPathEntry(
-                    compiledJar = Paths.get(it.compiledJar),
-                    sourceJar = it.sourceJar?.let(Paths::get)
-                )
-            }.toSet()
-        }
-        set(newEntries) = transaction(db) {
-            ClassPathCacheEntry.deleteAll()
-            newEntries.map {
-                ClassPathCacheEntryEntity.new {
-                    compiledJar = it.compiledJar.toString()
-                    sourceJar = it.sourceJar?.toString()
-                }
-            }
-        }
-
-    private var cachedBuildScriptClassPathEntries: Set<Path>
-        get() = transaction(db) { BuildScriptClassPathCacheEntryEntity.all().map { Paths.get(it.jar) }.toSet() }
-        set(newEntries) = transaction(db) {
-            BuildScriptClassPathCacheEntry.deleteAll()
-            newEntries.map { BuildScriptClassPathCacheEntryEntity.new { jar = it.toString() } }
-        }
-
-    private var cachedClassPathMetadata
-        get() = transaction(db) {
-            ClassPathMetadataCacheEntity.all().map {
-                ClasspathMetadata(
-                    includesSources = it.includesSources,
-                    buildFileVersion = it.buildFileVersion
-                )
-            }.firstOrNull()
-        }
-        set(newClassPathMetadata) = transaction(db) {
-            ClassPathMetadataCache.deleteAll()
-            val newClassPathMetadataRow = newClassPathMetadata ?: ClasspathMetadata()
-            ClassPathMetadataCacheEntity.new {
-                includesSources = newClassPathMetadataRow.includesSources
-                buildFileVersion = newClassPathMetadataRow.buildFileVersion
-            }
-        }
+    override val cacheIdentity: String get() = projectIdentity
+    override val freshnessFingerprint: String get() = wrapped.freshnessFingerprint
+    override val currentBuildFileVersion: Long get() = wrapped.currentBuildFileVersion
 
     init {
         transaction(db) {
@@ -107,70 +76,86 @@ internal class CachedClassPathResolver(
         }
     }
 
-    override val classpath: Set<ClassPathEntry> get() {
-        cachedClassPathEntries.let { if (!dependenciesChanged()) {
-            LOG.info("Classpath has not changed. Fetching from cache")
-            return it
-        } }
+    override val classpath: Set<ClassPathEntry> get() = resolve().classpath
+    override val classpathWithSources: Set<ClassPathEntry> get() = resolve().classpath
+    override val buildScriptClasspath: Set<Path> get() = resolve().buildScriptClasspath
 
-        LOG.info("Cached classpath is outdated or not found. Resolving again")
-
-        val newClasspath = wrapped.classpath
-        updateClasspathCache(newClasspath, false)
-
-        return newClasspath
-    }
-
-    override val buildScriptClasspath: Set<Path> get() {
-        if (!dependenciesChanged()) {
-            LOG.info("Build script classpath has not changed. Fetching from cache")
-            return cachedBuildScriptClassPathEntries
+    @Suppress("TooGenericExceptionCaught", "ReturnCount")
+    @Synchronized
+    override fun resolve(): ResolvedClassPath {
+        val cached = readCachedModel()
+        if (cached != null && cached.fingerprint == freshnessFingerprint && cached.pathsExist()) {
+            LOG.info("Loading fresh project model for '{}' from persistent cache", projectIdentity)
+            ClassPathInstrumentation.persistentCacheHit(projectIdentity)
+            return cached.model
         }
 
-        LOG.info("Cached build script classpath is outdated or not found. Resolving again")
+        ClassPathInstrumentation.underlyingResolution(projectIdentity)
+        val resolved = try {
+            wrapped.resolve()
+        } catch (error: Exception) {
+            if (cached != null) {
+                LOG.warn("Resolution for '{}' failed; retaining cached project model: {}", projectIdentity, error.message)
+                return cached.model
+            }
+            throw error
+        }
 
-        val newBuildScriptClasspath = wrapped.buildScriptClasspath
+        if (resolved.classpath.isEmpty()) {
+            if (cached != null) {
+                LOG.warn("Resolution for '{}' was empty; retaining cached project model", projectIdentity)
+                return cached.model
+            }
+            return resolved
+        }
 
-        updateBuildScriptClasspathCache(newBuildScriptClasspath)
-        return newBuildScriptClasspath
+        writeModel(resolved)
+        return resolved
     }
 
-    override val classpathWithSources: Set<ClassPathEntry> get() {
-        cachedClassPathMetadata?.let { if (!dependenciesChanged() && it.includesSources) return cachedClassPathEntries }
-
-        val newClasspath = wrapped.classpathWithSources
-        updateClasspathCache(newClasspath, true)
-
-        return newClasspath
+    private fun readCachedModel(): CachedModel? = transaction(db) {
+        val metadata = ClassPathMetadataCache.select { ClassPathMetadataCache.projectIdentity eq projectIdentity }
+            .firstOrNull() ?: return@transaction null
+        val classpath = ClassPathCacheEntry.select { ClassPathCacheEntry.projectIdentity eq projectIdentity }
+            .map { ClassPathEntry(Paths.get(it[ClassPathCacheEntry.compiledJar]), it[ClassPathCacheEntry.sourceJar]?.let(Paths::get)) }
+            .toSet()
+        if (classpath.isEmpty()) return@transaction null
+        val buildScripts = BuildScriptClassPathCacheEntry.select {
+            BuildScriptClassPathCacheEntry.projectIdentity eq projectIdentity
+        }
+            .map { Paths.get(it[BuildScriptClassPathCacheEntry.jar]) }
+            .toSet()
+        CachedModel(metadata[ClassPathMetadataCache.fingerprint], ResolvedClassPath(classpath, buildScripts))
     }
 
-    override val currentBuildFileVersion: Long get() = wrapped.currentBuildFileVersion
+    private fun writeModel(model: ResolvedClassPath) = transaction(db) {
+        ClassPathCacheEntry.deleteWhere { ClassPathCacheEntry.projectIdentity eq this@CachedClassPathResolver.projectIdentity }
+        BuildScriptClassPathCacheEntry.deleteWhere { BuildScriptClassPathCacheEntry.projectIdentity eq this@CachedClassPathResolver.projectIdentity }
+        ClassPathMetadataCache.deleteWhere { ClassPathMetadataCache.projectIdentity eq this@CachedClassPathResolver.projectIdentity }
 
-    private fun updateClasspathCache(newClasspathEntries: Set<ClassPathEntry>, includesSources: Boolean) {
-        transaction(db) {
-            cachedClassPathEntries = newClasspathEntries
-            cachedClassPathMetadata = cachedClassPathMetadata?.copy(
-                includesSources = includesSources,
-                buildFileVersion = currentBuildFileVersion
-            ) ?: ClasspathMetadata()
+        model.classpath.forEach { entry ->
+            ClassPathCacheEntry.insert {
+                it[projectIdentity] = this@CachedClassPathResolver.projectIdentity
+                it[compiledJar] = entry.compiledJar.toString()
+                it[sourceJar] = entry.sourceJar?.toString()
+            }
+        }
+        model.buildScriptClasspath.forEach { entry ->
+            BuildScriptClassPathCacheEntry.insert {
+                it[projectIdentity] = this@CachedClassPathResolver.projectIdentity
+                it[jar] = entry.toString()
+            }
+        }
+        ClassPathMetadataCache.insert {
+            it[projectIdentity] = this@CachedClassPathResolver.projectIdentity
+            it[fingerprint] = freshnessFingerprint
+            it[includesSources] = true
         }
     }
 
-    private fun updateBuildScriptClasspathCache(newClasspath: Set<Path>) {
-        transaction(db) {
-            cachedBuildScriptClassPathEntries = newClasspath
-            cachedClassPathMetadata = cachedClassPathMetadata?.copy(
-                buildFileVersion = currentBuildFileVersion
-            ) ?: ClasspathMetadata()
-        }
-    }
-
-    private fun dependenciesChanged(): Boolean {
-        return (cachedClassPathMetadata?.buildFileVersion ?: 0) < wrapped.currentBuildFileVersion
+    private data class CachedModel(val fingerprint: String, val model: ResolvedClassPath) {
+        fun pathsExist(): Boolean = model.classpath.all {
+            Files.exists(it.compiledJar) && (it.sourceJar == null || Files.exists(it.sourceJar))
+        } && model.buildScriptClasspath.all(Files::exists)
     }
 }
-
-private data class ClasspathMetadata(
-    val includesSources: Boolean = false,
-    val buildFileVersion: Long? = null
-)

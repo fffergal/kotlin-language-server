@@ -68,10 +68,15 @@ class SourceFiles(
     private val contentProvider: URIContentProvider,
     private val scriptsConfig: ScriptsConfiguration
 ) {
+    private val requestedWorkspaceRoots = mutableSetOf<Path>()
     private val workspaceRoots = mutableSetOf<Path>()
+    internal val requestedWorkspaceRootPaths: Set<Path> get() = requestedWorkspaceRoots.toSet()
+    internal val workspaceRootPaths: Set<Path> get() = workspaceRoots.toSet()
     private var exclusions = SourceExclusions(workspaceRoots, scriptsConfig)
     private val files = NotifySourcePath(sp)
     private val open = mutableSetOf<URI>()
+    private val javaSources = mutableSetOf<Path>()
+    val javaSourcePaths: Set<Path> get() = javaSources.toSet()
 
     fun open(uri: URI, content: String, version: Int) {
         if (isIncluded(uri)) {
@@ -154,38 +159,60 @@ class SourceFiles(
     }
 
     fun addWorkspaceRoot(root: Path) {
-        LOG.info("Searching $root using exclusions: ${exclusions.excludedPatterns}")
-        val addSources = findSourceFiles(root)
-
-        logAdded(addSources, root)
-
-        for (uri in addSources) {
-            readFromDisk(uri, temporary = false)?.let {
-                files[uri] = it
-            } ?: LOG.warn("Could not read source file '{}'", uri.path)
-        }
-
-        workspaceRoots.add(root)
-        updateExclusions()
+        requestedWorkspaceRoots.add(root.toAbsolutePath().normalize())
+        reconcileWorkspaceRoots()
     }
 
     fun removeWorkspaceRoot(root: Path) {
-        val rmSources = files.keys.filter { it.filePath?.startsWith(root) ?: false }
-
-        logRemoved(rmSources, root)
-
-        files.removeAll(rmSources)
-        workspaceRoots.remove(root)
-        updateExclusions()
+        requestedWorkspaceRoots.remove(root.toAbsolutePath().normalize())
+        reconcileWorkspaceRoots()
     }
 
-    private fun findSourceFiles(root: Path): Set<URI> {
-        val sourceMatcher = FileSystems.getDefault().getPathMatcher("glob:*.{kt,kts}")
-        return SourceExclusions(listOf(root), scriptsConfig)
-            .walkIncluded()
-            .filter { sourceMatcher.matches(it.fileName) }
+    private fun reconcileWorkspaceRoots() {
+        val normalized = normalizeRoots(requestedWorkspaceRoots)
+        if (normalized == workspaceRoots) return
+
+        val addedRoots = normalized - workspaceRoots
+        workspaceRoots.clear()
+        workspaceRoots.addAll(normalized)
+        updateExclusions()
+
+        for (root in addedRoots) {
+            LOG.info("Searching $root using exclusions: ${exclusions.excludedPatterns}")
+            val (foundSources, foundJavaSources) = findWorkspaceFiles(root)
+            val addSources = foundSources - files.keys
+            logAdded(addSources, root)
+            javaSources.addAll(foundJavaSources)
+            for (uri in addSources) {
+                readFromDisk(uri, temporary = false)?.let {
+                    files[uri] = it
+                } ?: LOG.warn("Could not read source file '{}'", uri.path)
+            }
+        }
+
+        val removedSources = files.keys.filter { uri ->
+            val path = uri.filePath
+            path != null && normalized.none(path::startsWith)
+        }
+        if (removedSources.isNotEmpty()) {
+            logRemoved(removedSources, null)
+            files.removeAll(removedSources)
+        }
+        javaSources.removeIf { path -> normalized.none(path::startsWith) }
+    }
+
+    private fun findWorkspaceFiles(root: Path): Pair<Set<URI>, Set<Path>> {
+        val kotlinMatcher = FileSystems.getDefault().getPathMatcher("glob:*.{kt,kts}")
+        val javaMatcher = FileSystems.getDefault().getPathMatcher("glob:*.java")
+        val included = SourceExclusions(listOf(root), scriptsConfig).walkIncluded().toList()
+        val kotlinSources = included.asSequence()
+            .filter { kotlinMatcher.matches(it.fileName) }
             .map(Path::toUri)
             .toSet()
+        val javaSources = included.asSequence()
+            .filter { javaMatcher.matches(it.fileName) }
+            .toSet()
+        return kotlinSources to javaSources
     }
 
     fun updateExclusions() {

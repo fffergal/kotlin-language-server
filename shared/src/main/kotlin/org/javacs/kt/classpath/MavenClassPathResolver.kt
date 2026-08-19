@@ -1,3 +1,5 @@
+@file:Suppress("TooManyFunctions")
+
 package org.javacs.kt.classpath
 
 import org.javacs.kt.LOG
@@ -13,6 +15,8 @@ internal class MavenClassPathResolver private constructor(private val pom: Path)
     private var artifacts: Set<Artifact>? = null
 
     override val resolverType: String = "Maven"
+    override val cacheIdentity: String get() = "maven:${pom.toAbsolutePath().normalize()}"
+    override val freshnessFingerprint: String get() = mavenModelFingerprint(pom)
 
     override val classpath: Set<ClassPathEntry> get() {
         val dependenciesOutput = generateMavenDependencyList(pom)
@@ -210,4 +214,36 @@ data class Artifact(
     var source: Boolean
 ) {
     override fun toString() = "$group:$artifact:$version"
+}
+
+private fun mavenModelFingerprint(start: Path): String {
+    val inputs = linkedSetOf<Path>()
+    var current: Path? = start.toAbsolutePath().normalize()
+    while (current != null && Files.isRegularFile(current) && inputs.add(current)) {
+        val text = Files.readString(current)
+        val parent = Regex("<parent(?:\\s[^>]*)?>(.*?)</parent>", RegexOption.DOT_MATCHES_ALL)
+            .find(text)?.groupValues?.get(1)
+        current = parent?.let { block ->
+            if (Regex("<relativePath\\s*/>").containsMatchIn(block)) return@let null
+            val relative = Regex("<relativePath(?:\\s[^>]*)?>(.*?)</relativePath>", RegexOption.DOT_MATCHES_ALL)
+                .find(block)?.groupValues?.get(1)?.trim()?.takeIf(String::isNotEmpty)
+                ?: "../pom.xml"
+            current.parent?.resolve(relative)?.normalize()?.takeIf(Files::isRegularFile)
+        }
+    }
+
+    generateSequence(start.toAbsolutePath().normalize().parent) { it.parent }
+        .map { it.resolve(".mvn") }
+        .firstOrNull(Files::isDirectory)
+        ?.let { directory ->
+            listOf("maven.config", "jvm.config", "extensions.xml")
+                .map(directory::resolve)
+                .filterTo(inputs, Files::isRegularFile)
+        }
+    Path.of(System.getProperty("user.home"), ".m2", "settings.xml")
+        .takeIf(Files::isRegularFile)
+        ?.let(inputs::add)
+
+    return inputs.sortedBy(Path::toString)
+        .joinToString("|") { input -> "$input:${input.contentFingerprint()}" }
 }

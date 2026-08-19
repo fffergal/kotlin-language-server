@@ -19,4 +19,6 @@ dependencies {
     implementation(libs.org.jetbrains.exposed.dao)
     testImplementation(libs.hamcrest.all)
     testImplementation(libs.junit.junit)
+    testImplementation(libs.org.xerial.sqlite.jdbc)
+    testImplementation(libs.org.jetbrains.exposed.jdbc)
 }

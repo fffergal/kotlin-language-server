@@ -34,7 +34,12 @@ class KotlinLanguageServer(
     val sourceFiles = SourceFiles(sourcePath, uriContentProvider, config.scripts)
 
     private val textDocuments = KotlinTextDocumentService(sourceFiles, sourcePath, config, tempDirectory, uriContentProvider, classPath)
-    private val workspaces = KotlinWorkspaceService(sourceFiles, sourcePath, classPath, textDocuments, config)
+    private val projectModels = ProjectModelLifecycle(classPath)
+    private val workspaces = KotlinWorkspaceService(
+        sourceFiles, sourcePath, classPath, textDocuments, config,
+        onConfigurationChanged = projectModels::configurationChanged,
+        onWorkspaceRootsChanged = projectModels::recordWorkspaceRoots
+    )
     private val protocolExtensions = KotlinProtocolExtensionService(uriContentProvider, classPath, sourcePath)
 
     private lateinit var client: LanguageClient
@@ -121,24 +126,21 @@ class KotlinLanguageServer(
             val progressPrefix = "[${i + 1}/${folders.size}] ${folder.name ?: ""}"
             val progressPercent = (100 * i) / folders.size
 
-            progress?.update("$progressPrefix: Updating source path", progressPercent)
+            progress?.update("$progressPrefix: Recording source path", progressPercent)
             val root = Paths.get(parseURI(folder.uri))
             sourceFiles.addWorkspaceRoot(root)
-
-            progress?.update("$progressPrefix: Updating class path", progressPercent)
-            val refreshed = classPath.addWorkspaceRoot(root)
-            if (refreshed) {
-                progress?.update("$progressPrefix: Refreshing source path", progressPercent)
-                sourcePath.refresh()
-            }
         }
+        classPath.recordJavaSourcePaths(sourceFiles.javaSourcePaths)
+        projectModels.recordWorkspaceRoots(folders.map { Paths.get(parseURI(it.uri)) })
         progress?.close()
-
-        textDocuments.lintAll()
 
         val serverInfo = ServerInfo("Kotlin Language Server", VERSION)
 
         InitializeResult(serverCapabilities, serverInfo)
+    }
+
+    override fun initialized(params: InitializedParams) {
+        projectModels.initialized()
     }
 
     private fun connectLoggingBackend() {
@@ -161,6 +163,7 @@ class KotlinLanguageServer(
 
     override fun close() {
         textDocumentService.close()
+        projectModels.close()
         classPath.close()
         tempDirectory.close()
         async.shutdown(awaitTermination = true)

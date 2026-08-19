@@ -19,6 +19,13 @@ import java.nio.file.Path
 import java.nio.file.Paths
 import java.net.URI
 import java.util.concurrent.locks.ReentrantLock
+import org.jetbrains.kotlin.resolve.lazy.NoDescriptorForDeclarationException
+
+internal enum class SemanticSnapshotState {
+    ABSENT,
+    CURRENT,
+    STALE,
+}
 
 class SourcePath(
     private val cp: CompilerClassPath,
@@ -28,6 +35,7 @@ class SourcePath(
 ) {
     private val files = mutableMapOf<URI, SourceFile>()
     private val parseDataWriteLock = ReentrantLock()
+    private val compileLock = ReentrantLock()
 
     private val indexAsync = AsyncExecutor()
     var indexEnabled: Boolean by indexingConfig::enabled
@@ -41,6 +49,7 @@ class SourcePath(
             index.progressFactory = factory
         }
 
+    @Suppress("LongParameterList")
     private inner class SourceFile(
         val uri: URI,
         var content: String,
@@ -49,25 +58,44 @@ class SourcePath(
         var compiledFile: KtFile? = null,
         var compiledContext: BindingContext? = null,
         var module: ModuleDescriptor? = null,
+        var compiledSourcePath: Collection<KtFile>? = null,
         val language: Language? = null,
         val isTemporary: Boolean = false, // A temporary source file will not be returned by .all()
         var lastSavedFile: KtFile? = null,
+        var dependenciesStale: Boolean = false,
     ) {
         val extension: String? = uri.fileExtension ?: "kt" // TODO: Use language?.associatedFileType?.defaultExtension again
         val isScript: Boolean = extension == "kts"
         val kind: CompilationKind =
             if (path?.fileName?.toString()?.endsWith(".gradle.kts") ?: false) CompilationKind.BUILD_SCRIPT
             else CompilationKind.DEFAULT
+        val snapshotState: SemanticSnapshotState
+            get() = when {
+                compiledFile == null || compiledContext == null || module == null || compiledSourcePath == null ->
+                    SemanticSnapshotState.ABSENT
+                compiledFile?.text != content || dependenciesStale -> SemanticSnapshotState.STALE
+                else -> SemanticSnapshotState.CURRENT
+            }
 
         fun put(newContent: String) {
             content = newContent
         }
 
-        fun clean() {
-            parsed = null
+        fun markDependenciesStale() {
+            if (snapshotState != SemanticSnapshotState.ABSENT) dependenciesStale = true
+        }
+
+        fun clearCompilation() {
             compiledFile = null
             compiledContext = null
             module = null
+            compiledSourcePath = null
+            dependenciesStale = false
+        }
+
+        fun clean() {
+            parsed = null
+            clearCompilation()
         }
 
         fun parse() {
@@ -81,52 +109,108 @@ class SourcePath(
             }
         }
 
-        fun compileIfNull() = parseIfChanged().apply { doCompileIfNull() }
-
-        private fun doCompileIfNull() {
-            if (compiledFile == null) {
-                doCompileIfChanged()
-            }
+        fun compileIfAbsent() = parseIfChanged().apply {
+            if (snapshotState == SemanticSnapshotState.ABSENT) doCompile()
         }
 
-        fun compileIfChanged() = parseIfChanged().apply { doCompileIfChanged() }
+        fun compileIfStale() = parseIfChanged().apply {
+            if (snapshotState != SemanticSnapshotState.CURRENT) doCompile()
+        }
 
         fun compile() = parse().apply { doCompile() }
 
         private fun doCompile() {
-            LOG.debug("Compiling {}", path?.fileName)
-
-            val oldFile = clone()
-
-            val (context, module) = cp.compiler.compileKtFile(parsed!!, allIncludingThis(), kind)
-            parseDataWriteLock.withLock {
-                compiledContext = context
-                this.module = module
-                compiledFile = parsed
+            LOG.debug("Compiling {} with workspace sources", path?.fileName)
+            if (java.lang.Boolean.getBoolean("kotlinLanguageServer.tracePerformance")) {
+                LOG.info("Performance trace: semantic-compilation {}", path?.toAbsolutePath())
             }
 
-            refreshWorkspaceIndexes(listOfNotNull(oldFile), listOfNotNull(this))
-        }
+            val oldFile = clone()
+            val currentFile = parsed!!
+            beforeCompileCallback.invoke()
+            val relevant = allIncludingThis()
+            val (result, workspaceSources) = try {
+                cp.compiler.compileKtFile(currentFile, relevant, kind) to relevant
+            } catch (error: NoDescriptorForDeclarationException) {
+                val complete = all()
+                if (complete.size <= relevant.size) throw error
+                cp.compiler.compileKtFile(currentFile, complete, kind) to complete
+            }
+            val (context, module) = result
+            val accepted = parseDataWriteLock.withLock {
+                if (parsed === currentFile && content == currentFile.text) {
+                    compiledContext = context
+                    this.module = module
+                    compiledFile = currentFile
+                    compiledSourcePath = workspaceSources
+                    dependenciesStale = false
+                    true
+                } else {
+                    false
+                }
+            }
 
-        private fun doCompileIfChanged() {
-            if (parsed?.text != compiledFile?.text) {
-                doCompile()
+            if (accepted) {
+                refreshWorkspaceIndexes(listOfNotNull(oldFile), listOf(clone()))
             }
         }
 
         fun prepareCompiledFile(): CompiledFile =
-                parseIfChanged().apply { compileIfNull() }.let { doPrepareCompiledFile() }
+            parseIfChanged().apply { compileIfAbsent() }.let { doPrepareCompiledFile() }
 
         private fun doPrepareCompiledFile(): CompiledFile =
-                CompiledFile(content, compiledFile!!, compiledContext!!, module!!, allIncludingThis(), cp, isScript, kind)
+            CompiledFile(content, compiledFile!!, compiledContext!!, module!!, compiledSourcePath!!, cp, isScript, kind)
 
         private fun allIncludingThis(): Collection<KtFile> = parseIfChanged().let {
             if (isTemporary) (all().asSequence() + sequenceOf(parsed!!)).toList()
-            else all()
+            else relevantSources(this)
         }
 
         // Creates a shallow copy
-        fun clone(): SourceFile = SourceFile(uri, content, path, parsed, compiledFile, compiledContext, module, language, isTemporary)
+        fun clone(): SourceFile = SourceFile(
+            uri, content, path, parsed, compiledFile, compiledContext, module, compiledSourcePath,
+            language, isTemporary, lastSavedFile, dependenciesStale
+        )
+    }
+
+
+    private fun relevantSourceFiles(source: SourceFile): List<SourceFile> {
+        val current = source.apply { parseIfChanged() }.parsed!!
+        val currentPackage = current.packageFqName.asString()
+        val imports = current.importDirectives.mapNotNull { it.importPath }
+        return files.values.filter { candidate ->
+            val parsed = candidate.apply { parseIfChanged() }.parsed!!
+            candidate === source || parsed.packageFqName.asString() == currentPackage ||
+                parsed.declarations.mapNotNull { it.name }.any { name ->
+                    val packageName = parsed.packageFqName.asString()
+                    val declaration = if (packageName.isEmpty()) name else "$packageName.$name"
+                    imports.any { imported ->
+                        val importedName = imported.fqName.asString()
+                        importedName == declaration ||
+                            importedName.startsWith("$declaration.") ||
+                            (imported.isAllUnder && declaration.startsWith("$importedName."))
+                    }
+                }
+        }
+    }
+
+    private fun relevantSources(source: SourceFile): Collection<KtFile> =
+        relevantSourceFiles(source).map { it.parsed!! }
+
+    private fun markDependentsStale(changed: Set<SourceFile>) {
+        val pending = ArrayDeque(changed)
+        val visited = changed.toMutableSet()
+        while (pending.isNotEmpty()) {
+            val dependency = pending.removeFirst()
+            files.values.asSequence()
+                .filterNot { it in visited }
+                .filter { candidate -> dependency in relevantSourceFiles(candidate) }
+                .forEach { candidate ->
+                    parseDataWriteLock.withLock { candidate.markDependenciesStale() }
+                    visited.add(candidate)
+                    pending.add(candidate)
+                }
+        }
     }
 
     private fun sourceFile(uri: URI): SourceFile {
@@ -147,9 +231,18 @@ class SourcePath(
         }
 
         if (uri in files) {
-            sourceFile(uri).put(content)
+            val source = sourceFile(uri)
+            if (source.content != content) {
+                markDependentsStale(setOf(source))
+                source.put(content)
+                markDependentsStale(setOf(source))
+            }
         } else {
-            files[uri] = SourceFile(uri, content, language = language, isTemporary = temporary)
+            val source = SourceFile(uri, content, language = language, isTemporary = temporary)
+            files[uri] = source
+            if (files.values.any { it !== source && it.snapshotState != SemanticSnapshotState.ABSENT }) {
+                markDependentsStale(setOf(source))
+            }
         }
     }
 
@@ -164,6 +257,7 @@ class SourcePath(
 
     fun delete(uri: URI) {
         files[uri]?.let {
+            markDependentsStale(setOf(it))
             refreshWorkspaceIndexes(listOf(it), listOf())
             cp.compiler.removeGeneratedCode(listOfNotNull(it.lastSavedFile))
         }
@@ -178,25 +272,30 @@ class SourcePath(
 
     fun parsedFile(uri: URI): KtFile = sourceFile(uri).apply { parseIfChanged() }.parsed!!
 
-    /**
-     * Compile the latest version of a file
-     */
-    fun currentVersion(uri: URI): CompiledFile =
-            sourceFile(uri).apply { compileIfChanged() }.prepareCompiledFile()
+    internal fun snapshotState(uri: URI): SemanticSnapshotState = compileLock.withLock {
+        sourceFile(uri).snapshotState
+    }
 
-    /**
-     * Return whatever is the most-recent already-compiled version of `file`
-     */
-    fun latestCompiledVersion(uri: URI): CompiledFile =
-            sourceFile(uri).prepareCompiledFile()
+    /** Compile the latest document and dependency version. */
+    fun currentVersion(uri: URI): CompiledFile = compileLock.withLock {
+        sourceFile(uri).apply { compileIfStale() }.prepareCompiledFile()
+    }
+
+    /** Return the newest available snapshot, including a stale one. */
+    fun latestCompiledVersion(uri: URI): CompiledFile = compileLock.withLock {
+        sourceFile(uri).prepareCompiledFile()
+    }
 
     /**
      * Compile changed files
      */
-    fun compileFiles(all: Collection<URI>): BindingContext {
-        // Figure out what has changed
-        val sources = all.map { files[it]!! }
-        val allChanged = sources.filter { it.content != it.compiledFile?.text }
+    fun compileFiles(all: Collection<URI>): BindingContext = compileLock.withLock {
+        // Refresh requested files and any existing snapshots made stale by them.
+        val requested = all.map { files[it]!! }
+        val staleDependents = files.values.filter { it.snapshotState == SemanticSnapshotState.STALE }
+        val sources = (requested + staleDependents).distinct()
+        val allChanged = sources.filter { it.snapshotState != SemanticSnapshotState.CURRENT }
+        val unchangedContexts = (requested - allChanged.toSet()).mapNotNull { it.compiledContext }
         val (changedBuildScripts, changedSources) = allChanged.partition { it.kind == CompilationKind.BUILD_SCRIPT }
 
         // Compile changed files
@@ -220,21 +319,26 @@ class SourcePath(
             beforeCompileCallback.invoke()
             val (context, module) = cp.compiler.compileKtFiles(parse.values, allFiles, kind)
 
-            // Update cache
-            for ((f, parsed) in parse) {
+            // Install only results whose exact parsed snapshot is still current.
+            val accepted = parse.mapNotNull { (file, parsed) ->
                 parseDataWriteLock.withLock {
-                    if (f.parsed == parsed) {
-                        //only updated if the parsed file didn't change:
-                        f.compiledFile = parsed
-                        f.compiledContext = context
-                        f.module = module
+                    if (file.parsed === parsed && file.content == parsed.text) {
+                        file.compiledFile = parsed
+                        file.compiledContext = context
+                        file.module = module
+                        file.compiledSourcePath = allFiles
+                        file.dependenciesStale = false
+                        file
+                    } else {
+                        null
                     }
                 }
             }
 
-            // Only index normal files, not build files
-            if (kind == CompilationKind.DEFAULT) {
-                refreshWorkspaceIndexes(oldFiles, parse.keys.toList())
+            // Only index normal files, not build files.
+            if (kind == CompilationKind.DEFAULT && accepted.isNotEmpty()) {
+                val acceptedOldFiles = oldFiles.filter { old -> accepted.any { it.uri == old.uri } }
+                refreshWorkspaceIndexes(acceptedOldFiles, accepted.map { it.clone() })
             }
 
             return context
@@ -244,8 +348,7 @@ class SourcePath(
         val sourcesContext = compileAndUpdate(changedSources, CompilationKind.DEFAULT)
 
         // Combine with past compilations
-        val same = sources - allChanged
-        val combined = listOf(buildScriptsContext, sourcesContext).filterNotNull() + same.map { it.compiledContext!! }
+        val combined = listOf(buildScriptsContext, sourcesContext).filterNotNull() + unchangedContexts
 
         return CompositeBindingContext.create(combined)
     }

@@ -48,6 +48,8 @@ class KotlinTextDocumentService(
     private val formattingService = FormattingService(config.formatting)
 
     var debounceLint = Debouncer(Duration.ofMillis(config.diagnostics.debounceTime))
+    private val lintLock = Any()
+    private val publishedDiagnostics = mutableSetOf<URI>()
     val lintTodo = mutableSetOf<URI>()
     var lintCount = 0
 
@@ -71,15 +73,18 @@ class KotlinTextDocumentService(
         this.client = client
     }
 
-    private enum class Recompile {
-        ALWAYS, AFTER_DOT, NEVER
+    private enum class SnapshotFreshness {
+        CURRENT_REQUIRED,
+        STALE_ALLOWED,
     }
 
-    private fun recover(position: TextDocumentPositionParams, recompile: Recompile): Pair<CompiledFile, Int>? {
-        return recover(position.textDocument.uri, position.position, recompile)
-    }
+    private fun recover(
+        position: TextDocumentPositionParams,
+        freshness: SnapshotFreshness,
+    ): Pair<CompiledFile, Int>? = recover(position.textDocument.uri, position.position, freshness)
 
-    private fun recover(uriString: String, position: Position, recompile: Recompile): Pair<CompiledFile, Int>? {
+    private fun recover(uriString: String, position: Position, freshness: SnapshotFreshness): Pair<CompiledFile, Int>? {
+        cp.awaitReady(parseURI(uriString).filePath)
         val uri = parseURI(uriString)
         if (!sf.isIncluded(uri)) {
             LOG.warn("URI is excluded, therefore cannot be recovered: $uri")
@@ -87,22 +92,20 @@ class KotlinTextDocumentService(
         }
         val content = sp.content(uri)
         val offset = offset(content, position.line, position.character)
-        val shouldRecompile = when (recompile) {
-            Recompile.ALWAYS -> true
-            Recompile.AFTER_DOT -> offset > 0 && content[offset - 1] == '.'
-            Recompile.NEVER -> false
+        val compiled = when (freshness) {
+            SnapshotFreshness.CURRENT_REQUIRED -> sp.currentVersion(uri)
+            SnapshotFreshness.STALE_ALLOWED -> sp.latestCompiledVersion(uri)
         }
-        val compiled = if (shouldRecompile) sp.currentVersion(uri) else sp.latestCompiledVersion(uri)
         return Pair(compiled, offset)
     }
 
     override fun codeAction(params: CodeActionParams): CompletableFuture<List<Either<Command, CodeAction>>> = async.compute {
-        val (file, _) = recover(params.textDocument.uri, params.range.start, Recompile.NEVER) ?: return@compute emptyList()
+        val (file, _) = recover(params.textDocument.uri, params.range.start, SnapshotFreshness.STALE_ALLOWED) ?: return@compute emptyList()
         codeActions(file, sp.index, params.range, params.context)
     }
 
     override fun inlayHint(params: InlayHintParams): CompletableFuture<List<InlayHint>> = async.compute {
-        val (file, _) = recover(params.textDocument.uri, params.range.start, Recompile.ALWAYS) ?: return@compute emptyList()
+        val (file, _) = recover(params.textDocument.uri, params.range.start, SnapshotFreshness.CURRENT_REQUIRED) ?: return@compute emptyList()
         provideHints(file, config.inlayHints)
     }
 
@@ -110,13 +113,13 @@ class KotlinTextDocumentService(
         reportTime {
             LOG.info("Hovering at {}", describePosition(position))
 
-            val (file, cursor) = recover(position, Recompile.NEVER) ?: return@compute null
+            val (file, cursor) = recover(position, SnapshotFreshness.STALE_ALLOWED) ?: return@compute null
             hoverAt(file, cursor) ?: noResult("No hover found at ${describePosition(position)}", null)
         }
     }
 
     override fun documentHighlight(position: DocumentHighlightParams): CompletableFuture<List<DocumentHighlight>> = async.compute {
-        val (file, cursor) = recover(position.textDocument.uri, position.position, Recompile.NEVER) ?: return@compute emptyList()
+        val (file, cursor) = recover(position.textDocument.uri, position.position, SnapshotFreshness.STALE_ALLOWED) ?: return@compute emptyList()
         documentHighlightsAt(file, cursor)
     }
 
@@ -128,7 +131,8 @@ class KotlinTextDocumentService(
         reportTime {
             LOG.info("Go-to-definition at {}", describePosition(position))
 
-            val (file, cursor) = recover(position, Recompile.NEVER) ?: return@compute Either.forLeft(emptyList())
+            val (file, cursor) = recover(position, SnapshotFreshness.CURRENT_REQUIRED)
+                ?: return@compute Either.forLeft(emptyList())
             goToDefinition(file, cursor, uriContentProvider.classContentProvider, tempDirectory, config.externalSources, cp)
                 ?.let(::listOf)
                 ?.let { Either.forLeft<List<Location>, List<LocationLink>>(it) }
@@ -149,7 +153,7 @@ class KotlinTextDocumentService(
     }
 
     override fun rename(params: RenameParams) = async.compute {
-        val (file, cursor) = recover(params, Recompile.NEVER) ?: return@compute null
+        val (file, cursor) = recover(params, SnapshotFreshness.STALE_ALLOWED) ?: return@compute null
         renameSymbol(file, cursor, sp, params.newName)
     }
 
@@ -157,7 +161,7 @@ class KotlinTextDocumentService(
         reportTime {
             LOG.info("Completing at {}", describePosition(position))
 
-            val (file, cursor) = recover(position, Recompile.NEVER) ?: return@compute Either.forRight(CompletionList()) // TODO: Investigate when to recompile
+            val (file, cursor) = recover(position, SnapshotFreshness.STALE_ALLOWED) ?: return@compute Either.forRight(CompletionList()) // TODO: Investigate when to recompile
             val completions = completions(file, cursor, sp.index, config.completion)
             LOG.info("Found {} items", completions.items.size)
 
@@ -200,7 +204,7 @@ class KotlinTextDocumentService(
         reportTime {
             LOG.info("Signature help at {}", describePosition(position))
 
-            val (file, cursor) = recover(position, Recompile.NEVER) ?: return@compute null
+            val (file, cursor) = recover(position, SnapshotFreshness.STALE_ALLOWED) ?: return@compute null
             fetchSignatureHelpAt(file, cursor) ?: noResult("No function call around ${describePosition(position)}", null)
         }
     }
@@ -272,7 +276,9 @@ class KotlinTextDocumentService(
     }
 
     public fun updateDebouncer() {
+        val previous = debounceLint
         debounceLint = Debouncer(Duration.ofMillis(config.diagnostics.debounceTime))
+        previous.shutdown(awaitTermination = false)
     }
 
     fun lintAll() {
@@ -283,28 +289,39 @@ class KotlinTextDocumentService(
         }
     }
 
-    private fun clearLint(): List<URI> {
+    private fun clearLint(): List<URI> = synchronized(lintLock) {
         val result = lintTodo.toList()
         lintTodo.clear()
-        return result
+        result
+    }
+
+    private fun queueLint(uri: URI, immediately: Boolean) {
+        synchronized(lintLock) { lintTodo.add(uri) }
+        val task = { cancelCallback: () -> Boolean -> doLint(cancelCallback) }
+        if (immediately) debounceLint.submitImmediately(task) else debounceLint.schedule(task)
     }
 
     private fun lintLater(uri: URI) {
-        lintTodo.add(uri)
-        debounceLint.schedule(::doLint)
+        queueLint(uri, immediately = false)
     }
 
     private fun lintNow(file: URI) {
-        lintTodo.add(file)
-        debounceLint.submitImmediately(::doLint)
+        queueLint(file, immediately = true)
     }
 
     private fun doLint(cancelCallback: () -> Boolean) {
-        LOG.info("Linting {}", describeURIs(lintTodo))
+        cp.awaitReady()
         val files = clearLint()
+        if (files.isEmpty()) return
+        LOG.info("Refreshing semantic state for {}", describeURIs(files))
         val context = sp.compileFiles(files)
         if (!cancelCallback.invoke()) {
-            reportDiagnostics(files, context.diagnostics)
+            val currentFiles = files.filter { sp.snapshotState(it) == SemanticSnapshotState.CURRENT }
+            if (config.diagnostics.enabled) {
+                reportDiagnostics(currentFiles, context.diagnostics)
+            } else {
+                currentFiles.filter { sf.isOpen(it) && it in publishedDiagnostics }.forEach(::clearDiagnostics)
+            }
         }
         lintCount++
     }
@@ -312,12 +329,14 @@ class KotlinTextDocumentService(
     private fun reportDiagnostics(compiled: Collection<URI>, kotlinDiagnostics: Diagnostics) {
         val langServerDiagnostics = kotlinDiagnostics
             .flatMap(::convertDiagnostic)
+            .filter { it.first in compiled }
             .filter { config.diagnostics.enabled && it.second.severity <= config.diagnostics.level }
         val byFile = langServerDiagnostics.groupBy({ it.first }, { it.second })
 
         for ((uri, diagnostics) in byFile) {
             if (sf.isOpen(uri)) {
                 client.publishDiagnostics(PublishDiagnosticsParams(uri.toString(), diagnostics))
+                publishedDiagnostics.add(uri)
 
                 LOG.info("Reported {} diagnostics in {}", diagnostics.size, describeURI(uri))
             }
@@ -330,12 +349,11 @@ class KotlinTextDocumentService(
 
             LOG.info("No diagnostics in {}", file)
         }
-
-        lintCount++
     }
 
     private fun clearDiagnostics(uri: URI) {
         client.publishDiagnostics(PublishDiagnosticsParams(uri.toString(), listOf()))
+        publishedDiagnostics.remove(uri)
     }
 
     private fun shutdownExecutors(awaitTermination: Boolean) {

@@ -14,6 +14,8 @@ import org.jetbrains.kotlin.cli.common.CLIConfigurationKeys
 import org.jetbrains.kotlin.cli.common.environment.setIdeaIoUseFallback
 import org.jetbrains.kotlin.cli.jvm.config.addJavaSourceRoots
 import org.jetbrains.kotlin.cli.jvm.config.addJvmClasspathRoots
+import org.jetbrains.kotlin.cli.jvm.config.JavaSourceRoot
+import org.jetbrains.kotlin.cli.jvm.config.JvmClasspathRoot
 import org.jetbrains.kotlin.config.CommonConfigurationKeys
 import org.jetbrains.kotlin.config.CompilerConfiguration as KotlinCompilerConfiguration
 import org.jetbrains.kotlin.container.ComponentProvider
@@ -422,6 +424,12 @@ private class CompilationEnvironment(
             ?.let { environment.configuration.put(JVMConfigurationKeys.JVM_TARGET, it) }
     }
 
+    fun updateClasspath(javaSourcePath: Set<Path>, classPath: Set<Path>) {
+        val roots = classPath.map { JvmClasspathRoot(it.toFile()) } +
+            javaSourcePath.map { JavaSourceRoot(it.toFile(), null) }
+        environment.updateClasspath(roots)
+    }
+
     fun createContainer(sourcePath: Collection<KtFile>): Pair<ComponentProvider, BindingTraceContext> {
         val trace = CliBindingTrace(environment.project)
         val container = TopDownAnalyzerFacadeForJVM.createContainer(
@@ -460,7 +468,7 @@ class Compiler(
     javaSourcePath: Set<Path>,
     classPath: Set<Path>,
     buildScriptClassPath: Set<Path> = emptySet(),
-    scriptsConfig: ScriptsConfiguration,
+    private val scriptsConfig: ScriptsConfiguration,
     private val codegenConfig: CodegenConfiguration,
     private val outputDirectory: File,
 ) : Closeable {
@@ -468,9 +476,19 @@ class Compiler(
     private val localFileSystem: VirtualFileSystem
 
     private val defaultCompileEnvironment = CompilationEnvironment(javaSourcePath, classPath, scriptsConfig)
-    private val buildScriptCompileEnvironment = buildScriptClassPath
-        .takeIf { it.isNotEmpty() && scriptsConfig.enabled && scriptsConfig.buildScriptsEnabled }
-        ?.let { CompilationEnvironment(emptySet(), it, scriptsConfig) }
+    private var currentBuildScriptClassPath = buildScriptClassPath
+    private var currentConfiguration: CompilerConfiguration? = null
+    private var buildScriptCompileEnvironment: CompilationEnvironment? = null
+    @Synchronized
+    private fun buildScriptEnvironment(): CompilationEnvironment? {
+        buildScriptCompileEnvironment?.let { return it }
+        return currentBuildScriptClassPath
+            .takeIf { it.isNotEmpty() && scriptsConfig.enabled && scriptsConfig.buildScriptsEnabled }
+            ?.let { paths -> CompilationEnvironment(emptySet(), paths, scriptsConfig).also { environment ->
+                currentConfiguration?.let(environment::updateConfiguration)
+                buildScriptCompileEnvironment = environment
+            } }
+    }
     private val compileLock = ReentrantLock() // TODO: Lock at file-level
 
     companion object {
@@ -488,8 +506,15 @@ class Compiler(
      * configuration (which is a class from this project).
      */
     fun updateConfiguration(config: CompilerConfiguration) {
+        currentConfiguration = config
         defaultCompileEnvironment.updateConfiguration(config)
         buildScriptCompileEnvironment?.updateConfiguration(config)
+    }
+
+    fun updateClasspath(javaSourcePath: Set<Path>, classPath: Set<Path>, buildScriptClassPath: Set<Path>) {
+        defaultCompileEnvironment.updateClasspath(javaSourcePath, classPath)
+        currentBuildScriptClassPath = buildScriptClassPath
+        buildScriptCompileEnvironment?.updateClasspath(emptySet(), buildScriptClassPath)
     }
 
     fun createPsiFile(content: String, file: Path = Paths.get("dummy.virtual.kt"), language: Language = KotlinLanguage.INSTANCE, kind: CompilationKind = CompilationKind.DEFAULT): PsiFile {
@@ -529,7 +554,7 @@ class Compiler(
 
     private fun compileEnvironmentFor(kind: CompilationKind): CompilationEnvironment = when (kind) {
         CompilationKind.DEFAULT -> defaultCompileEnvironment
-        CompilationKind.BUILD_SCRIPT -> buildScriptCompileEnvironment ?: defaultCompileEnvironment
+        CompilationKind.BUILD_SCRIPT -> buildScriptEnvironment() ?: defaultCompileEnvironment
     }
 
     fun psiFileFactoryFor(kind: CompilationKind): PsiFileFactory =

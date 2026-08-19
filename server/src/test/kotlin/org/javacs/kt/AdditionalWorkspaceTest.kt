@@ -43,3 +43,31 @@ class AdditionalWorkspaceTest : LanguageServerTestFixture("mainWorkspace") {
         assertThat(hoverAgain.contents.right.value, containsString("fun assertTrue"))
     }
 }
+
+
+class OverlappingWorkspaceTest : LanguageServerTestFixture("Workspace") {
+    private val child = workspaceRoot.resolve("ProjectA").toAbsolutePath().normalize()
+
+    @Test fun `nested workspace addition keeps one effective source root`() {
+        changeWorkspaceFolders(added = listOf(child))
+
+        assertThat(languageServer.sourceFiles.workspaceRootPaths, equalTo(setOf(workspaceRoot.toAbsolutePath().normalize())))
+        assertThat(languageServer.sourceFiles.requestedWorkspaceRootPaths, hasItem(child))
+    }
+
+    @Test fun `removing parent retains still requested child sources`() {
+        changeWorkspaceFolders(added = listOf(child))
+        changeWorkspaceFolders(removed = listOf(workspaceRoot.toAbsolutePath().normalize()))
+
+        assertThat(languageServer.sourceFiles.workspaceRootPaths, equalTo(setOf(child)))
+        assertThat(languageServer.sourceFiles.isIncluded(child.resolve("src/UsesSharedLibrary.kt").toUri()), equalTo(true))
+    }
+
+    private fun changeWorkspaceFolders(added: List<java.nio.file.Path> = emptyList(), removed: List<java.nio.file.Path> = emptyList()) {
+        val event = WorkspaceFoldersChangeEvent().apply {
+            this.added = added.map { path -> WorkspaceFolder(path.toUri().toString(), path.fileName.toString()) }
+            this.removed = removed.map { path -> WorkspaceFolder(path.toUri().toString(), path.fileName.toString()) }
+        }
+        languageServer.workspaceService.didChangeWorkspaceFolders(DidChangeWorkspaceFoldersParams(event))
+    }
+}

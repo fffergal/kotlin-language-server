@@ -2,11 +2,25 @@ package org.javacs.kt.classpath
 
 import org.javacs.kt.LOG
 import java.nio.file.Path
+import java.nio.file.Files
+import java.security.MessageDigest
 import kotlin.math.max
+
+/** One coherent result from a single resolver freshness state. */
+data class ResolvedClassPath(
+    val classpath: Set<ClassPathEntry>,
+    val buildScriptClasspath: Set<Path> = emptySet()
+)
 
 /** A source for creating class paths */
 interface ClassPathResolver {
     val resolverType: String
+
+    /** Stable identity used to isolate persistent project models. */
+    val cacheIdentity: String? get() = null
+
+    /** Changes whenever inputs affecting this resolver change. */
+    val freshnessFingerprint: String get() = currentBuildFileVersion.toString()
 
     val classpath: Set<ClassPathEntry> // may throw exceptions
     val classpathOrEmpty: Set<ClassPathEntry> // does not throw exceptions
@@ -28,6 +42,9 @@ interface ClassPathResolver {
         }
 
     val classpathWithSources: Set<ClassPathEntry> get() = classpath
+
+    /** Resolves all classpath views as one model. Implementations should override when discovery is expensive. */
+    fun resolve(): ResolvedClassPath = ResolvedClassPath(classpathWithSources, buildScriptClasspathOrEmpty)
 
     /**
      * This should return the current build file version.
@@ -66,6 +83,11 @@ internal class UnionClassPathResolver(val lhs: ClassPathResolver, val rhs: Class
     override val buildScriptClasspath get() = lhs.buildScriptClasspath + rhs.buildScriptClasspath
     override val buildScriptClasspathOrEmpty get() = lhs.buildScriptClasspathOrEmpty + rhs.buildScriptClasspathOrEmpty
     override val classpathWithSources get() = lhs.classpathWithSources + rhs.classpathWithSources
+    override fun resolve(): ResolvedClassPath {
+        val left = lhs.resolve()
+        val right = rhs.resolve()
+        return ResolvedClassPath(left.classpath + right.classpath, left.buildScriptClasspath + right.buildScriptClasspath)
+    }
     override val currentBuildFileVersion: Long get() = max(lhs.currentBuildFileVersion, rhs.currentBuildFileVersion)
 }
 
@@ -78,5 +100,34 @@ internal class FirstNonEmptyClassPathResolver(val lhs: ClassPathResolver, val rh
     override val classpathWithSources get() = lhs.classpathWithSources.takeIf {
         it.isNotEmpty()
     } ?: rhs.classpathWithSources
+    override fun resolve(): ResolvedClassPath {
+        val left = lhs.resolve()
+        return if (left.classpath.isNotEmpty()) left else rhs.resolve()
+    }
     override val currentBuildFileVersion: Long get() = max(lhs.currentBuildFileVersion, rhs.currentBuildFileVersion)
+}
+
+internal fun Path.contentFingerprint(): String {
+    val digest = MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(this))
+    return digest.joinToString("") { byte -> "%02x".format(byte) }
+}
+
+/** Resolves independent project models concurrently, then combines their coherent snapshots. */
+internal class ParallelClassPathResolver(
+    private val resolvers: Collection<ClassPathResolver>
+) : ClassPathResolver {
+    override val resolverType: String = resolvers.joinToString(prefix = "parallel(", postfix = ")") { it.resolverType }
+    override val classpath: Set<ClassPathEntry> get() = resolve().classpath
+    override val buildScriptClasspath: Set<Path> get() = resolve().buildScriptClasspath
+
+    override fun resolve(): ResolvedClassPath {
+        val futures = resolvers.map { resolver ->
+            java.util.concurrent.CompletableFuture.supplyAsync(resolver::resolve)
+        }
+        val models = futures.map { it.join() }
+        return ResolvedClassPath(
+            models.flatMap { it.classpath }.toSet(),
+            models.flatMap { it.buildScriptClasspath }.toSet()
+        )
+    }
 }

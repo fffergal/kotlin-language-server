@@ -14,6 +14,8 @@ internal class ShellClassPathResolver(
     private val workingDir: Path? = null
 ) : ClassPathResolver {
     override val resolverType: String = "Shell"
+    override val cacheIdentity: String get() = "shell:${script.toAbsolutePath().normalize()}"
+    override val freshnessFingerprint: String get() = "${script.toFile().length()}:${script.toFile().lastModified()}"
     override val classpath: Set<ClassPathEntry> get() {
         val workingDirectory = workingDir?.toFile() ?: script.toAbsolutePath().parent.toFile()
         val cmd = script.toString()

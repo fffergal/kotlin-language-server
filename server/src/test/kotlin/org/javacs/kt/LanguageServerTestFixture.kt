@@ -1,5 +1,6 @@
 package org.javacs.kt
 
+import com.google.gson.JsonObject
 import org.eclipse.lsp4j.*
 import org.eclipse.lsp4j.services.LanguageClient
 import org.junit.Before
@@ -10,12 +11,14 @@ import java.util.concurrent.CompletableFuture
 
 abstract class LanguageServerTestFixture(
     relativeWorkspaceRoot: String,
-    config: Configuration = Configuration()
+    config: Configuration = Configuration(),
+    private val startProjectModel: Boolean = true
 ) : LanguageClient {
     val workspaceRoot = absoluteWorkspaceRoot(relativeWorkspaceRoot)
     val languageServer = createLanguageServer(config)
 
     var diagnostics = listOf<Diagnostic>()
+    var diagnosticPublicationCount = 0
     val errors: List<Diagnostic>
         get() = diagnostics.filter { it.severity == DiagnosticSeverity.Error }
     val warnings: List<Diagnostic>
@@ -53,6 +56,10 @@ abstract class LanguageServerTestFixture(
         languageServer.sourcePath.indexEnabled = false
         languageServer.connect(this)
         languageServer.initialize(init).join()
+        if (startProjectModel) {
+            languageServer.initialized(InitializedParams())
+            languageServer.workspaceService.didChangeConfiguration(DidChangeConfigurationParams(JsonObject()))
+        }
 
         return languageServer
     }
@@ -154,6 +161,7 @@ abstract class LanguageServerTestFixture(
     // LanguageClient functions
 
     override fun publishDiagnostics(diagnostics: PublishDiagnosticsParams) {
+        diagnosticPublicationCount++
         this.diagnostics = diagnostics.diagnostics
     }
 

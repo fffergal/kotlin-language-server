@@ -32,7 +32,7 @@ public data class DiagnosticsConfiguration(
     /** The minimum severity of enabled diagnostics. */
     var level: DiagnosticSeverity = DiagnosticSeverity.Hint,
     /** The time interval between subsequent lints in ms. */
-    var debounceTime: Long = 250L
+    var debounceTime: Long = 1000L
 )
 
 public data class JVMConfiguration(
