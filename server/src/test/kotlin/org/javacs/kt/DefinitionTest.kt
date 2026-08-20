@@ -75,3 +75,35 @@ class GoToDefinitionOfPropertiesTest : SingleFileTestFixture("definition", "GoTo
         assertThat(ranges, hasItem(equalTo(expect)))
     }
 }
+
+
+class GoToDefinitionOfOverridesTest : SingleFileTestFixture("definition", "OverrideDefinitions.kt") {
+
+    @Test fun `delegated fake override resolves to original interface declaration`() {
+        assertDefinition(position(14, 40), range(2, 9, 2, 22))
+    }
+
+    @Test fun `inherited fake override resolves through multiple levels`() {
+        assertDefinition(position(24, 40), range(18, 9, 18, 22))
+    }
+
+    @Test fun `diamond override graph resolves deterministically without duplicate traversal`() {
+        assertDefinition(position(35, 38), range(28, 9, 28, 20))
+    }
+
+    @Test fun `direct override wins over its overridden declaration`() {
+        assertDefinition(position(44, 37), range(43, 18, 43, 28))
+    }
+
+    @Test fun `direct constructor definition remains unchanged`() {
+        assertDefinition(position(48, 39), range(47, 18, 47, 37))
+    }
+
+    private fun assertDefinition(of: Position, expected: Range) {
+        val definitions = languageServer.textDocumentService.definition(definitionParams(file, of)).get().left
+
+        assertThat(definitions, hasSize(1))
+        assertThat(definitions.single().uri, containsString(file))
+        assertThat(definitions.single().range, equalTo(expected))
+    }
+}

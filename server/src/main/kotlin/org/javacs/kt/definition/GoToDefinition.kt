@@ -18,9 +18,13 @@ import org.javacs.kt.util.TemporaryDirectory
 import org.javacs.kt.util.parseURI
 import org.jetbrains.kotlin.js.resolve.diagnostics.findPsi
 import org.jetbrains.kotlin.psi.KtNamedDeclaration
+import org.jetbrains.kotlin.descriptors.CallableMemberDescriptor
 import org.jetbrains.kotlin.descriptors.ConstructorDescriptor
+import org.jetbrains.kotlin.descriptors.DeclarationDescriptor
 import java.io.File
 import java.nio.file.Paths
+import java.util.Collections
+import java.util.IdentityHashMap
 
 private val cachedTempFiles = mutableMapOf<KlsURI, Path>()
 private val definitionPattern = Regex("(?:class|interface|object|fun)\\s+(\\w+)")
@@ -36,16 +40,16 @@ fun goToDefinition(
     val (_, target) = file.referenceExpressionAtPoint(cursor) ?: return null
 
     LOG.info("Found declaration descriptor {}", target)
-    var destination = location(target)
-    val psi = target.findPsi()
+    val resolved = resolveDefinition(target)
+    if (resolved != null) {
+        val selected = resolved.descriptor
+        val destination = resolved.location
 
-    if (psi is KtNamedDeclaration) {
-        destination = psi.nameIdentifier?.let(::location) ?: destination
-    }
+        if (selected !== target) {
+            LOG.debug("Resolved definition for synthetic descriptor {} through overridden descriptor {}", target, selected)
+        }
 
-    if (destination != null) {
         val rawClassURI = destination.uri
-
         if (isInsideArchive(rawClassURI, cp)) {
             parseURI(rawClassURI).toKlsURI()?.let { klsURI ->
                 val (klsSourceURI, content) = classContentProvider.contentOf(klsURI)
@@ -73,9 +77,9 @@ fun goToDefinition(
 
                 if (destination.range.isZero) {
                     // Try to find the definition inside the source directly
-                    val name = when (target) {
-                        is ConstructorDescriptor -> target.constructedClass.name.toString()
-                        else -> target.name.toString()
+                    val name = when (selected) {
+                        is ConstructorDescriptor -> selected.constructedClass.name.toString()
+                        else -> selected.name.toString()
                     }
                     definitionPattern.findAll(content)
                         .map { it.groups[1]!! }
@@ -87,8 +91,45 @@ fun goToDefinition(
         }
     }
 
-    return destination
+    return resolved?.location
 }
+
+private data class ResolvedDefinition(
+    val descriptor: DeclarationDescriptor,
+    val location: Location,
+)
+
+private fun resolveDefinition(target: DeclarationDescriptor): ResolvedDefinition? {
+    val direct = descriptorLocation(target)
+    if (direct != null || target !is CallableMemberDescriptor) {
+        return direct?.let { ResolvedDefinition(target, it) }
+    }
+
+    val visited = Collections.newSetFromMap(IdentityHashMap<DeclarationDescriptor, Boolean>())
+    val pending = ArrayDeque<DeclarationDescriptor>()
+    var sourceFallback: ResolvedDefinition? = null
+    var externalFallback: ResolvedDefinition? = null
+    visited.add(target)
+    target.overriddenDescriptors.forEach(pending::addLast)
+
+    while (pending.isNotEmpty() && sourceFallback == null) {
+        val candidate = pending.removeFirst()
+        if (!visited.add(candidate)) continue
+
+        sourceFallback = sourceDeclarationLocation(candidate)?.let { ResolvedDefinition(candidate, it) }
+        if (externalFallback == null) {
+            location(candidate)?.let { externalFallback = ResolvedDefinition(candidate, it) }
+        }
+        (candidate as? CallableMemberDescriptor)?.overriddenDescriptors?.forEach(pending::addLast)
+    }
+    return sourceFallback ?: externalFallback
+}
+
+private fun descriptorLocation(descriptor: DeclarationDescriptor): Location? =
+    sourceDeclarationLocation(descriptor) ?: location(descriptor)
+
+private fun sourceDeclarationLocation(descriptor: DeclarationDescriptor): Location? =
+    (descriptor.findPsi() as? KtNamedDeclaration)?.nameIdentifier?.let(::location)
 
 private fun isInsideArchive(uri: String, cp: CompilerClassPath) =
     uri.contains(".jar!") || uri.contains(".zip!") || cp.javaHome?.let {
