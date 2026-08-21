@@ -10,6 +10,7 @@ import org.javacs.kt.definition.goToDefinition
 import org.javacs.kt.diagnostic.convertDiagnostic
 import org.javacs.kt.formatting.FormattingService
 import org.javacs.kt.hover.hoverAt
+import org.javacs.kt.implementation.findImplementations
 import org.javacs.kt.position.offset
 import org.javacs.kt.position.extractRange
 import org.javacs.kt.position.position
@@ -99,6 +100,18 @@ class KotlinTextDocumentService(
         return Pair(compiled, offset)
     }
 
+    private fun recoverWorkspace(position: TextDocumentPositionParams): Pair<WorkspaceCompilation, Int>? {
+        cp.awaitReady(parseURI(position.textDocument.uri).filePath)
+        val uri = parseURI(position.textDocument.uri)
+        if (!sf.isIncluded(uri)) {
+            LOG.warn("URI is excluded, therefore cannot be recovered: $uri")
+            return null
+        }
+        val content = sp.content(uri)
+        val offset = offset(content, position.position.line, position.position.character)
+        return sp.currentWorkspaceVersion(uri) to offset
+    }
+
     override fun codeAction(params: CodeActionParams): CompletableFuture<List<Either<Command, CodeAction>>> = async.compute {
         val (file, _) = recover(params.textDocument.uri, params.range.start, SnapshotFreshness.STALE_ALLOWED) ?: return@compute emptyList()
         codeActions(file, sp.index, params.range, params.context)
@@ -137,6 +150,16 @@ class KotlinTextDocumentService(
                 ?.let(::listOf)
                 ?.let { Either.forLeft<List<Location>, List<LocationLink>>(it) }
                 ?: noResult("Couldn't find definition at ${describePosition(position)}", Either.forLeft(emptyList()))
+        }
+    }
+
+    override fun implementation(position: ImplementationParams): CompletableFuture<Either<List<Location>, List<LocationLink>>> = async.compute {
+        reportTime {
+            LOG.info("Go-to-implementations at {}", describePosition(position))
+
+            val (workspace, cursor) = recoverWorkspace(position)
+                ?: return@compute Either.forLeft(emptyList())
+            Either.forLeft(findImplementations(workspace, cursor))
         }
     }
 

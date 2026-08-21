@@ -15,6 +15,8 @@ abstract class LanguageServerTestFixture(
     private val startProjectModel: Boolean = true
 ) : LanguageClient {
     val workspaceRoot = absoluteWorkspaceRoot(relativeWorkspaceRoot)
+    lateinit var initializeResult: InitializeResult
+        private set
     val languageServer = createLanguageServer(config)
 
     var diagnostics = listOf<Diagnostic>()
@@ -55,7 +57,7 @@ abstract class LanguageServerTestFixture(
         }
         languageServer.sourcePath.indexEnabled = false
         languageServer.connect(this)
-        languageServer.initialize(init).join()
+        initializeResult = languageServer.initialize(init).join()
         if (startProjectModel) {
             languageServer.initialized(InitializedParams())
             languageServer.workspaceService.didChangeConfiguration(DidChangeConfigurationParams(JsonObject()))
@@ -118,6 +120,9 @@ abstract class LanguageServerTestFixture(
 
     fun definitionParams(relativePath: String, position: Position): DefinitionParams =
         textDocumentPosition(relativePath, position).run { DefinitionParams(textDocument, position) }
+
+    fun implementationParams(relativePath: String, line: Int, column: Int): ImplementationParams =
+        textDocumentPosition(relativePath, line, column).run { ImplementationParams(textDocument, position) }
 
     fun textDocumentPosition(relativePath: String, position: Position): TextDocumentPositionParams {
         val file = workspaceRoot.resolve(relativePath)

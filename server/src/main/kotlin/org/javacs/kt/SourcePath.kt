@@ -27,6 +27,12 @@ internal enum class SemanticSnapshotState {
     STALE,
 }
 
+internal data class WorkspaceCompilation(
+    val requestedFile: CompiledFile,
+    val sourceFiles: Collection<KtFile>,
+    val context: BindingContext,
+)
+
 class SourcePath(
     private val cp: CompilerClassPath,
     private val contentProvider: URIContentProvider,
@@ -279,6 +285,14 @@ class SourcePath(
     /** Compile the latest document and dependency version. */
     fun currentVersion(uri: URI): CompiledFile = compileLock.withLock {
         sourceFile(uri).apply { compileIfStale() }.prepareCompiledFile()
+    }
+
+    /** Return current semantic results for every workspace source and the requested file. */
+    internal fun currentWorkspaceVersion(uri: URI): WorkspaceCompilation = compileLock.withLock {
+        val workspaceUris = files.values.filterNot { it.isTemporary }.map { it.uri }
+        val context = compileFiles(workspaceUris)
+        val requested = sourceFile(uri).apply { compileIfStale() }.prepareCompiledFile()
+        WorkspaceCompilation(requested, all(), context)
     }
 
     /** Return the newest available snapshot, including a stale one. */
