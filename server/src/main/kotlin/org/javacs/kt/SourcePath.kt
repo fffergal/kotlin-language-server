@@ -42,6 +42,18 @@ class SourcePath(
     private val files = mutableMapOf<URI, SourceFile>()
     private val parseDataWriteLock = ReentrantLock()
     private val compileLock = ReentrantLock()
+    private val dependencyGraphLock = ReentrantLock()
+
+    private data class SourceDependencyMetadata(
+        val packageName: String,
+        val imports: List<Pair<String, Boolean>>,
+        val declarations: Set<String>,
+    )
+
+    private val dependencyMetadata = mutableMapOf<URI, SourceDependencyMetadata>()
+    private val sourceDependencies = mutableMapOf<URI, Set<URI>>()
+    private val sourceDependents = mutableMapOf<URI, MutableSet<URI>>()
+    private var dependencyGraphInitialized = false
 
     private val indexAsync = AsyncExecutor()
     var indexEnabled: Boolean by indexingConfig::enabled
@@ -180,41 +192,99 @@ class SourcePath(
     }
 
 
+    private fun sourceMetadata(source: SourceFile): SourceDependencyMetadata {
+        val parsed = source.apply { parseIfChanged() }.parsed!!
+        val packageName = parsed.packageFqName.asString()
+        return SourceDependencyMetadata(
+            packageName,
+            parsed.importDirectives.mapNotNull { directive ->
+                directive.importPath?.let { it.fqName.asString() to it.isAllUnder }
+            },
+            parsed.declarations.mapNotNullTo(mutableSetOf()) { declaration ->
+                declaration.name?.let { name -> if (packageName.isEmpty()) name else "$packageName.$name" }
+            },
+        )
+    }
+
+    private fun dependsOn(
+        candidateUri: URI,
+        candidate: SourceDependencyMetadata,
+        dependencyUri: URI,
+        dependency: SourceDependencyMetadata,
+    ): Boolean = candidateUri == dependencyUri || candidate.packageName == dependency.packageName ||
+        dependency.declarations.any { declaration ->
+            candidate.imports.any { (importedName, allUnder) ->
+                importedName == declaration || importedName.startsWith("$declaration.") ||
+                    (allUnder && declaration.startsWith("$importedName."))
+            }
+        }
+
+    private fun dependenciesOf(uri: URI): Set<URI> {
+        val candidate = dependencyMetadata.getValue(uri)
+        return dependencyMetadata.mapNotNullTo(mutableSetOf()) { (dependencyUri, dependency) ->
+            dependencyUri.takeIf { dependsOn(uri, candidate, dependencyUri, dependency) }
+        }
+    }
+
+    private fun setDependencies(uri: URI, dependencies: Set<URI>) {
+        sourceDependencies.put(uri, dependencies).orEmpty().forEach { dependency ->
+            sourceDependents[dependency]?.let { dependents ->
+                dependents.remove(uri)
+                if (dependents.isEmpty()) sourceDependents.remove(dependency)
+            }
+        }
+        dependencies.forEach { dependency ->
+            sourceDependents.getOrPut(dependency) { mutableSetOf() }.add(uri)
+        }
+    }
+
+    private fun ensureDependencyGraph() = dependencyGraphLock.withLock {
+        if (!dependencyGraphInitialized || dependencyMetadata.keys != files.keys) {
+            dependencyMetadata.clear()
+            sourceDependencies.clear()
+            sourceDependents.clear()
+            files.values.forEach { dependencyMetadata[it.uri] = sourceMetadata(it) }
+            dependencyMetadata.keys.forEach { uri -> setDependencies(uri, dependenciesOf(uri)) }
+            dependencyGraphInitialized = true
+        }
+    }
+
+    private fun refreshDependencyGraph(source: SourceFile) = dependencyGraphLock.withLock {
+        ensureDependencyGraph()
+        val oldCandidates = sourceDependents[source.uri].orEmpty().toSet()
+        val newMetadata = sourceMetadata(source)
+        dependencyMetadata[source.uri] = newMetadata
+        val newCandidates = dependencyMetadata.mapNotNullTo(mutableSetOf()) { (uri, candidate) ->
+            uri.takeIf { dependsOn(uri, candidate, source.uri, newMetadata) }
+        }
+        (oldCandidates + newCandidates + source.uri).forEach { uri ->
+            if (uri in dependencyMetadata) setDependencies(uri, dependenciesOf(uri))
+        }
+    }
+
     private fun relevantSourceFiles(source: SourceFile): List<SourceFile> {
-        val current = source.apply { parseIfChanged() }.parsed!!
-        val currentPackage = current.packageFqName.asString()
-        val imports = current.importDirectives.mapNotNull { it.importPath }
-        return files.values.filter { candidate ->
-            val parsed = candidate.apply { parseIfChanged() }.parsed!!
-            candidate === source || parsed.packageFqName.asString() == currentPackage ||
-                parsed.declarations.mapNotNull { it.name }.any { name ->
-                    val packageName = parsed.packageFqName.asString()
-                    val declaration = if (packageName.isEmpty()) name else "$packageName.$name"
-                    imports.any { imported ->
-                        val importedName = imported.fqName.asString()
-                        importedName == declaration ||
-                            importedName.startsWith("$declaration.") ||
-                            (imported.isAllUnder && declaration.startsWith("$importedName."))
-                    }
-                }
+        ensureDependencyGraph()
+        return dependencyGraphLock.withLock {
+            sourceDependencies[source.uri].orEmpty().mapNotNull(files::get)
         }
     }
 
     private fun relevantSources(source: SourceFile): Collection<KtFile> =
-        relevantSourceFiles(source).map { it.parsed!! }
+        relevantSourceFiles(source).map { it.apply { parseIfChanged() }.parsed!! }
 
     private fun markDependentsStale(changed: Set<SourceFile>) {
-        val pending = ArrayDeque(changed)
-        val visited = changed.toMutableSet()
+        ensureDependencyGraph()
+        val pending = ArrayDeque(changed.map { it.uri })
+        val visited = changed.mapTo(mutableSetOf()) { it.uri }
         while (pending.isNotEmpty()) {
             val dependency = pending.removeFirst()
-            files.values.asSequence()
-                .filterNot { it in visited }
-                .filter { candidate -> dependency in relevantSourceFiles(candidate) }
-                .forEach { candidate ->
-                    parseDataWriteLock.withLock { candidate.markDependenciesStale() }
-                    visited.add(candidate)
-                    pending.add(candidate)
+            dependencyGraphLock.withLock { sourceDependents[dependency].orEmpty().toList() }
+                .filter { visited.add(it) }
+                .forEach { candidateUri ->
+                    files[candidateUri]?.let { candidate ->
+                        parseDataWriteLock.withLock { candidate.markDependenciesStale() }
+                        pending.add(candidateUri)
+                    }
                 }
         }
     }
@@ -241,11 +311,13 @@ class SourcePath(
             if (source.content != content) {
                 markDependentsStale(setOf(source))
                 source.put(content)
+                refreshDependencyGraph(source)
                 markDependentsStale(setOf(source))
             }
         } else {
             val source = SourceFile(uri, content, language = language, isTemporary = temporary)
             files[uri] = source
+            dependencyGraphInitialized = false
             if (files.values.any { it !== source && it.snapshotState != SemanticSnapshotState.ABSENT }) {
                 markDependentsStale(setOf(source))
             }
@@ -269,6 +341,7 @@ class SourcePath(
         }
 
         files.remove(uri)
+        dependencyGraphInitialized = false
     }
 
     /**

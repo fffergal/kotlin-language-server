@@ -42,6 +42,8 @@ class SemanticRefreshTest : LanguageServerTestFixture(
     }
 
     @Test fun `completion uses previous semantic snapshot before idle refresh`() {
+        languageServer.config.diagnostics.debounceTime = 3000
+        languageServer.textDocumentService.updateDebouncer()
         val compilations = AtomicInteger()
         languageServer.textDocumentService.lintRecompilationCallback = { compilations.incrementAndGet() }
         open(consumer)
@@ -118,5 +120,58 @@ class SemanticRefreshTest : LanguageServerTestFixture(
             .completion(completionParams(consumer, 8, 20))
             .get().right.items.map { it.label }
         assertThat(refreshedLabels, hasItem("addedFunction()"))
+    }
+
+    @Test fun `new declaration relationship invalidates an existing importer`() {
+        val sourcePath = languageServer.sourcePath
+        val consumerUri = uri(consumer)
+        val dependencyUri = uri(dependency)
+
+        sourcePath.put(
+            consumerUri,
+            sourcePath.content(consumerUri)
+                .replace("SharedLibrary", "FutureLibrary"),
+            null,
+        )
+        sourcePath.currentVersion(consumerUri)
+        assertThat(sourcePath.snapshotState(consumerUri), equalTo(SemanticSnapshotState.CURRENT))
+
+        sourcePath.put(
+            dependencyUri,
+            sourcePath.content(dependencyUri)
+                .replace("SharedLibrary", "FutureLibrary"),
+            null,
+        )
+
+        assertThat(sourcePath.snapshotState(consumerUri), equalTo(SemanticSnapshotState.STALE))
+    }
+
+    @Test fun `dependency edit invalidates transitive reverse dependents`() {
+        val sourcePath = languageServer.sourcePath
+        val baseUri = workspaceRoot.resolve("graph/base/Base.kt").toUri()
+        val middleUri = workspaceRoot.resolve("graph/middle/Middle.kt").toUri()
+        val consumerUri = workspaceRoot.resolve("graph/consumer/Consumer.kt").toUri()
+
+        sourcePath.put(baseUri, "package graph.base\nclass Base", null)
+        sourcePath.put(
+            middleUri,
+            "package graph.middle\nimport graph.base.Base\nclass Middle : Base()",
+            null,
+        )
+        sourcePath.put(
+            consumerUri,
+            "package graph.consumer\nimport graph.middle.Middle\nfun consume(value: Middle) = value",
+            null,
+        )
+        sourcePath.currentVersion(baseUri)
+        sourcePath.currentVersion(middleUri)
+        sourcePath.currentVersion(consumerUri)
+        assertThat(sourcePath.snapshotState(middleUri), equalTo(SemanticSnapshotState.CURRENT))
+        assertThat(sourcePath.snapshotState(consumerUri), equalTo(SemanticSnapshotState.CURRENT))
+
+        sourcePath.put(baseUri, "package graph.base\nclass Base(val changed: Boolean = true)", null)
+
+        assertThat(sourcePath.snapshotState(middleUri), equalTo(SemanticSnapshotState.STALE))
+        assertThat(sourcePath.snapshotState(consumerUri), equalTo(SemanticSnapshotState.STALE))
     }
 }
