@@ -109,6 +109,10 @@ class KotlinLanguageServer(
         if (clientCapabilities?.window?.workDoneProgress ?: false) {
             progressFactory = LanguageClientProgress.Factory(client)
         }
+        val signatureInformation = clientCapabilities?.textDocument?.signatureHelp?.signatureInformation
+        config.signatureHelp.labelOffsetSupport =
+            signatureInformation?.parameterInformation?.labelOffsetSupport ?: false
+        config.signatureHelp.activeParameterSupport = signatureInformation?.activeParameterSupport ?: false
 
         if (clientCapabilities?.textDocument?.rename?.prepareSupport ?: false) {
             serverCapabilities.renameProvider = Either.forRight(RenameOptions(false))

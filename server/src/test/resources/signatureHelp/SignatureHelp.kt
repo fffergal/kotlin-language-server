@@ -4,6 +4,9 @@ private object SignatureHelp {
         Constructor()
         Target.multiParam("1", )
         Target.oneOrTwoArgs("1", )
+        Target.differentLayouts("1", )
+        Target.complex({ first, second -> }, )
+        Target.get()
     }
 }
 
@@ -32,6 +35,21 @@ private object Target {
     }
 
     fun oneOrTwoArgs(first: String, second: String) {
+    }
+
+    fun differentLayouts(first: String) {
+    }
+
+    fun differentLayouts(first: String, second: Int, third: Boolean) {
+    }
+
+    fun complex(callback: (Int, String) -> Unit, value: String) {
+    }
+
+    fun get(index: Int) {
+    }
+
+    fun get(fieldName: String) {
     }
 }
 

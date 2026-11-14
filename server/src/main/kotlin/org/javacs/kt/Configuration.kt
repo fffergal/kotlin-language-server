@@ -22,6 +22,11 @@ public data class CodegenConfiguration(
     var enabled: Boolean = false
 )
 
+public data class SignatureHelpConfiguration(
+    var labelOffsetSupport: Boolean = false,
+    var activeParameterSupport: Boolean = false,
+)
+
 public data class CompletionConfiguration(
     val snippets: SnippetsConfiguration = SnippetsConfiguration()
 )
@@ -108,6 +113,7 @@ public data class Configuration(
     val codegen: CodegenConfiguration = CodegenConfiguration(),
     val compiler: CompilerConfiguration = CompilerConfiguration(),
     val completion: CompletionConfiguration = CompletionConfiguration(),
+    val signatureHelp: SignatureHelpConfiguration = SignatureHelpConfiguration(),
     val diagnostics: DiagnosticsConfiguration = DiagnosticsConfiguration(),
     val scripts: ScriptsConfiguration = ScriptsConfiguration(),
     val indexing: IndexingConfiguration = IndexingConfiguration(),

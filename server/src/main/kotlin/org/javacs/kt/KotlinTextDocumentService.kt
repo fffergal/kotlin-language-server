@@ -228,7 +228,7 @@ class KotlinTextDocumentService(
             LOG.info("Signature help at {}", describePosition(position))
 
             val (file, cursor) = recover(position, SnapshotFreshness.STALE_ALLOWED) ?: return@compute null
-            fetchSignatureHelpAt(file, cursor) ?: noResult("No function call around ${describePosition(position)}", null)
+            fetchSignatureHelpAt(file, cursor, config.signatureHelp) ?: noResult("No function call around ${describePosition(position)}", null)
         }
     }
 

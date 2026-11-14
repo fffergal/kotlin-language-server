@@ -41,6 +41,12 @@ abstract class LanguageServerTestFixture(
                             snippetSupport = true
                         }
                     }
+                    signatureHelp = SignatureHelpCapabilities().apply {
+                        signatureInformation = SignatureInformationCapabilities().apply {
+                            parameterInformation = ParameterInformationCapabilities(true)
+                            activeParameterSupport = true
+                        }
+                    }
                 }
             }
         }
