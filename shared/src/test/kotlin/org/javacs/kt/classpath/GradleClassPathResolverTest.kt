@@ -14,13 +14,14 @@ class GradleClassPathResolverTest {
         Files.writeString(buildFile, "")
         val mainJar = Files.createTempFile("main", ".jar")
         val testJar = Files.createTempFile("test", ".jar")
+        val sourceJar = Files.createTempFile("main", "-sources.jar")
         val buildScriptJar = Files.createTempFile("buildscript", ".jar")
         val calls = project.resolve("calls.txt")
         val wrapper = project.resolve(if (isOSWindows()) "gradlew.bat" else "gradlew")
         val script = if (isOSWindows()) {
-            "@echo off\r\necho call>>\"$calls\"\r\necho kotlin-lsp-gradle $mainJar\r\necho kotlin-lsp-gradle $testJar\r\necho kotlin-lsp-buildscript $buildScriptJar\r\n"
+            "@echo off\r\necho call>>\"$calls\"\r\necho kotlin-lsp-gradle-entry\t$mainJar\t$sourceJar\r\necho kotlin-lsp-gradle $mainJar\r\necho kotlin-lsp-gradle $testJar\r\necho kotlin-lsp-buildscript $buildScriptJar\r\n"
         } else {
-            "#!/bin/sh\necho call >> '$calls'\necho 'kotlin-lsp-gradle $mainJar'\necho 'kotlin-lsp-gradle $testJar'\necho 'kotlin-lsp-buildscript $buildScriptJar'\n"
+            "#!/bin/sh\necho call >> '$calls'\nprintf 'kotlin-lsp-gradle-entry\\t%s\\t%s\\n' '$mainJar' '$sourceJar'\necho 'kotlin-lsp-gradle $mainJar'\necho 'kotlin-lsp-gradle $testJar'\necho 'kotlin-lsp-buildscript $buildScriptJar'\n"
         }
         Files.writeString(wrapper, script)
         wrapper.toFile().setExecutable(true)
@@ -29,6 +30,7 @@ class GradleClassPathResolverTest {
 
         assertThat(model.classpath.map { it.compiledJar }, containsInAnyOrder(mainJar, testJar))
         assertThat(model.buildScriptClasspath, equalTo(setOf(buildScriptJar)))
+        assertThat(model.classpath.single { it.compiledJar == mainJar }.sourceJar, equalTo(sourceJar))
         assertThat(Files.readAllLines(calls).size, equalTo(1))
     }
 

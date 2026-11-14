@@ -1,3 +1,28 @@
+import org.gradle.jvm.JvmLibrary
+import org.gradle.language.base.artifact.SourcesArtifact
+
+void printClasspathWithSources(project, configuration) {
+    try {
+        def artifacts = configuration.incoming.artifacts.artifacts
+        def componentIds = artifacts.collect { it.id.componentIdentifier }.toSet()
+        def sourceResult = project.dependencies.createArtifactResolutionQuery()
+            .forComponents(componentIds)
+            .withArtifacts(JvmLibrary, SourcesArtifact)
+            .execute()
+        def sourcesByComponent = [:]
+        sourceResult.resolvedComponents.each { component ->
+            def sources = component.getArtifacts(SourcesArtifact)
+            if (!sources.empty) sourcesByComponent[component.id] = sources.first().file
+        }
+        artifacts.each { artifact ->
+            def source = sourcesByComponent[artifact.id.componentIdentifier]
+            System.out.println "kotlin-lsp-gradle-entry\t${artifact.file}\t${source ?: ''}"
+        }
+    } catch (Exception error) {
+        System.err.println "ERROR: Could not resolve source artifacts for ${configuration.name}: ${error.message}"
+    }
+}
+
 allprojects { project ->
     task kotlinLSPProjectDeps { task ->
         doLast {
@@ -53,6 +78,10 @@ allprojects { project ->
             } else if (project.hasProperty('sourceSets')) {
                 // Print the list of all dependencies jar files.
                 sourceSets.forEach {
+                    def configuration = project.configurations.findByName(it.compileClasspathConfigurationName)
+                    if (configuration != null && configuration.canBeResolved) {
+                        printClasspathWithSources(project, configuration)
+                    }
                     it.compileClasspath.forEach {
                         System.out.println "kotlin-lsp-gradle $it"
                     }
@@ -68,6 +97,9 @@ allprojects { project ->
                 // Print the list of all dependencies jar files.
                 kotlinExtension.targets.names.each {
                     def classpath = configurations["${it}CompileClasspath"]
+                    if (classpath.canBeResolved) {
+                        printClasspathWithSources(project, classpath)
+                    }
                     classpath.files.each {
                         System.out.println "kotlin-lsp-gradle $it"
                     }

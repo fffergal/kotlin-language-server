@@ -36,14 +36,17 @@ class ClassContentProvider(
      */
     fun contentOf(uri: KlsURI): Pair<KlsURI, String> {
         LOG.info("Resolving {} for contents", uri)
-        val resolvedUri = sourceArchiveProvider.fetchSourceArchive(uri.archivePath)?.let(uri.withSource(true)::withArchivePath) ?: uri
+        val sourceArchiveUri = sourceArchiveProvider.fetchSourceArchive(uri.archivePath)
+            ?.let(uri.withSource(true)::withArchivePath)
+        val resolvedUri = sourceArchiveUri ?: uri
         val key = resolvedUri.toString()
         val (contents, extension) = cachedContents[key] ?: run {
                 LOG.info("Reading contents of {}", describeURI(resolvedUri.fileUri))
-                tryReadContentOf(resolvedUri)
-                    ?: tryReadContentOf(resolvedUri.withFileExtension("class"))
-                    ?: tryReadContentOf(resolvedUri.withFileExtension("java"))
-                    ?: tryReadContentOf(resolvedUri.withFileExtension("kt"))
+                tryReadAnyContentOf(resolvedUri)
+                    ?: sourceArchiveUri?.let {
+                        LOG.info("Source archive did not contain {}; falling back to compiled archive", uri.fileName)
+                        tryReadAnyContentOf(uri)
+                    }
                     ?: throw KotlinLSException("Could not find $uri")
             }.also { cachedContents[key] = it }
         val sourceUri = resolvedUri.withFileExtension(extension)
@@ -56,6 +59,12 @@ class ClassContentProvider(
         javaCode
     }
 
+
+    private fun tryReadAnyContentOf(uri: KlsURI): Pair<String, String>? =
+        tryReadContentOf(uri)
+            ?: tryReadContentOf(uri.withFileExtension("class"))
+            ?: tryReadContentOf(uri.withFileExtension("java"))
+            ?: tryReadContentOf(uri.withFileExtension("kt"))
     private fun tryReadContentOf(uri: KlsURI): Pair<String, String>? = try {
         when (uri.fileExtension) {
             "class" -> Pair(uri.extractToTemporaryFile(tempDir)

@@ -14,7 +14,7 @@ internal class GradleClassPathResolver(private val path: Path, private val inclu
     override val resolverType: String = "Gradle"
     private val projectDirectory: Path get() = path.parent
     override val cacheIdentity: String get() = "gradle:${projectDirectory.toAbsolutePath().normalize()}"
-    override val freshnessFingerprint: String get() = projectDirectory.toFile().walkTopDown()
+    override val freshnessFingerprint: String get() = "gradle-model-with-sources-v1|" + projectDirectory.toFile().walkTopDown()
         .onEnter { it.name !in setOf(".git", ".gradle", "build", "out", "target", "node_modules") }
         .filter { file -> file.isFile && file.name.let { name ->
             name == "build.gradle" || name == "build.gradle.kts" ||
@@ -56,11 +56,11 @@ internal class GradleClassPathResolver(private val path: Path, private val inclu
             scripts += "kotlinDSLClassPathFinder.gradle"
             tasks += "kotlinLSPKotlinDSLDeps"
         }
-        val (compiled, buildScripts) = readCoherentGradleModel(projectDirectory, scripts, tasks)
-        if (compiled.isNotEmpty()) {
+        val (classpath, buildScripts) = readCoherentGradleModel(projectDirectory, scripts, tasks)
+        if (classpath.isNotEmpty()) {
             LOG.info("Successfully resolved coherent project model for '{}' using Gradle", projectDirectory.fileName)
         }
-        return ResolvedClassPath(compiled.map { ClassPathEntry(it, null) }.toSet(), buildScripts)
+        return ResolvedClassPath(classpath, buildScripts)
     }
 
     companion object {
@@ -75,7 +75,7 @@ private fun readCoherentGradleModel(
     projectDirectory: Path,
     gradleScripts: List<String>,
     gradleTasks: List<String>
-): Pair<Set<Path>, Set<Path>> {
+): Pair<Set<ClassPathEntry>, Set<Path>> {
     LOG.info("Resolving coherent project model for '{}' through one Gradle invocation...", projectDirectory.fileName)
     val tmpScripts = gradleScripts.map { gradleScriptToTempFile(it).toPath().toAbsolutePath() }
     return try {
@@ -84,10 +84,23 @@ private fun readCoherentGradleModel(
             tmpScripts.flatMap { listOf("-I", it.toString()) } + gradleTasks + listOf("--console=plain")
         val (output, errors) = execAndReadStdoutAndStderr(command, projectDirectory)
         if ("FAILURE: Build failed" in errors) throw KotlinLSException("Gradle project-model task failed: $errors")
-        Pair(parseGradlePaths(output, "kotlin-lsp-gradle"), parseGradlePaths(output, "kotlin-lsp-buildscript"))
+        Pair(parseGradleClassPath(output), parseGradlePaths(output, "kotlin-lsp-buildscript"))
     } finally {
         tmpScripts.forEach(Files::deleteIfExists)
     }
+}
+
+private val gradleEntryPattern = Regex("(?m)^kotlin-lsp-gradle-entry\\t([^\\t\\r\\n]+)\\t([^\\r\\n]*)$")
+
+private fun parseGradleClassPath(output: String): Set<ClassPathEntry> {
+    val attached = gradleEntryPattern.findAll(output).associate { match ->
+        val compiled = Paths.get(match.groupValues[1])
+        val source = match.groupValues[2].takeIf(String::isNotEmpty)?.let(Paths::get)
+        compiled to ClassPathEntry(compiled, source)
+    }
+    val legacy = parseGradlePaths(output, "kotlin-lsp-gradle")
+        .associateWith { compiled -> ClassPathEntry(compiled, null) }
+    return (legacy + attached).values.toSet()
 }
 
 private fun parseGradlePaths(output: String, prefix: String): Set<Path> =
